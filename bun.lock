@@ -2,7 +2,7 @@
   "lockfileVersion": 1,
   "workspaces": {
     "": {
-      "name": "betterauth-dynamodb",
+      "name": "@bjorntech/betterauth-dynamodb",
       "dependencies": {
         "@aws-sdk/client-dynamodb": "^3.758.0",
         "@aws-sdk/lib-dynamodb": "^3.758.0",

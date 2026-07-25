@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { entitySk, indexPk, indexSk, modelPk, uniquePk } from "../src/keys";
-import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, stripUndefined, toIndexSidecars, toStoredItem } from "../src/serialize";
+import { entitySk, indexPk, indexSk, modelPk, uniquePk } from "../src/keys.js";
+import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, stripUndefined, toIndexSidecars, toStoredItem } from "../src/serialize.js";
 
 class CustomValue {
   constructor(

@@ -1,18 +1,33 @@
 {
-  "name": "betterauth-dynamodb",
+  "name": "@bjorntech/betterauth-dynamodb",
   "version": "0.1.0",
   "description": "Production-oriented Better Auth DynamoDB adapter",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bjorntech/betterauth-dynamodb.git"
+  },
+  "homepage": "https://github.com/bjorntech/betterauth-dynamodb#readme",
+  "bugs": {
+    "url": "https://github.com/bjorntech/betterauth-dynamodb/issues"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "format": "prettier --write .",
     "lint": "eslint .",
@@ -22,8 +37,10 @@
     "test:integration:local": "vitest run --config vitest.integration.config.ts",
     "build": "tsc -p tsconfig.build.json",
     "quality:crap": "bun scripts/crap-check.ts coverage/lcov.info src",
+    "smoke:dist-import": "bun run build && node scripts/dist-import-smoke.mjs",
     "verify": "bun run typecheck && bun run lint && bun run test:coverage && bun run quality:crap && bun run build",
-    "verify:integration": "bun run test:integration:local"
+    "verify:integration": "bun run test:integration:local",
+    "prepack": "bun run build"
   },
   "peerDependencies": {
     "better-auth": "^1.6.23"

@@ -1,21 +1,21 @@
-# betterauth-dynamodb
+# @bjorntech/betterauth-dynamodb
 
 Production-oriented DynamoDB adapter for Better Auth `^1.6.23`, implemented with Better Auth's official `createAdapterFactory` API.
 
 ## Status
 
-This repository is an initial package implementation intended for future public use. It has unit coverage for command construction, adapter semantics, query planning, and Better Auth factory wiring, plus an explicit Docker-backed DynamoDB Local integration suite.
+This repository is an initial package implementation prepared for restricted/private npm publication as `@bjorntech/betterauth-dynamodb@0.1.0`. It has unit coverage for command construction, adapter semantics, query planning, and Better Auth factory wiring, plus an explicit Docker-backed DynamoDB Local integration suite.
 
 Pre-release storage note: in November 2025 the adapter design was corrected to remove the misleading generic `gsi1`/`idx_<field>_*` model. Scalar equality lookups now use transactionally maintained sidecar rows in the base table. In July 2026 key components changed to delimiter-safe length-prefixed strings, sidecar/unique-lock values use SHA-256 hashes, and entity rows gained hidden internal revision metadata for ABA-safe mutations. Existing experimental tables created with older formats should be recreated or migrated before using this version; pre-revision rows can still be read but fail clearly if mutated.
 
-The package may not be published to a registry yet. Until publication is confirmed, install it from this repository or a local workspace/path rather than assuming npm availability.
+The package may not be published to a registry yet. Until restricted npm publication and your access are confirmed by the project owner, install it from this repository or a local workspace/path rather than assuming npm availability.
 
 ## Installation
 
-If published in your environment:
+If published in your environment and your npm account has access to the private/restricted package:
 
 ```sh
-bun add betterauth-dynamodb better-auth @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb
+bun add @bjorntech/betterauth-dynamodb better-auth @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb
 ```
 
 For local development before publication, use the package manager workflow for a local path/workspace dependency, for example from a consuming app:
@@ -34,7 +34,7 @@ Prefer injecting a `DynamoDBDocumentClient` so your application owns AWS configu
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { betterAuth } from "better-auth";
-import { dynamoDBAdapter } from "betterauth-dynamodb";
+import { dynamoDBAdapter } from "@bjorntech/betterauth-dynamodb";
 
 const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true }
@@ -55,7 +55,7 @@ For local development you may pass `region`, `endpoint`, and/or `dynamoDBClientC
 ## API
 
 ```ts
-import { dynamoDBAdapter } from "betterauth-dynamodb";
+import { dynamoDBAdapter } from "@bjorntech/betterauth-dynamodb";
 ```
 
 `dynamoDBAdapter(options)` accepts:
@@ -71,7 +71,7 @@ import { dynamoDBAdapter } from "betterauth-dynamodb";
 
 The package also exports `BetterAuthDynamoDBOptions`, `TtlOptions`, `DynamoDBAdapterError`, and `UnsupportedQueryError`.
 
-## SST / Document Hub-style integration
+## SST / Lambda integration
 
 For SST v4 Lambda apps that use `Resource.*` links, keep table ownership in the app and inject a document client into the adapter:
 
@@ -79,7 +79,7 @@ For SST v4 Lambda apps that use `Resource.*` links, keep table ownership in the 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { betterAuth } from "better-auth";
-import { dynamoDBAdapter } from "betterauth-dynamodb";
+import { dynamoDBAdapter } from "@bjorntech/betterauth-dynamodb";
 import { Resource } from "sst";
 
 const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
@@ -162,6 +162,7 @@ The verification command fails if any implementation function has CRAP `> 6`. Do
 - `bun run test:integration:local`
 - `bun run quality:crap`
 - `bun run build`
+- `bun run smoke:dist-import`
 - `bun run verify`
 - `bun run verify:integration`
 
@@ -172,3 +173,5 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md). Contributions should preserve atomic c
 ## License
 
 MIT © 2026 BjornTech AB. See [LICENSE](./LICENSE).
+
+The MIT license describes the code license; it does not imply public npm package access.

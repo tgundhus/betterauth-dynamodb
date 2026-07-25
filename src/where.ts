@@ -1,5 +1,5 @@
-import type { CleanedWhere, QueryPlan } from "./types";
-import { UnsupportedQueryError } from "./errors";
+import { UnsupportedQueryError } from "./errors.js";
+import type { CleanedWhere, QueryPlan } from "./types.js";
 
 type WhereOperator = CleanedWhere["operator"];
 

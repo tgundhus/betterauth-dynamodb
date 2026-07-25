@@ -3,6 +3,8 @@ import traverse from "@babel/traverse";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 
+const traverseAst = typeof traverse === "function" ? traverse : traverse.default;
+
 const [lcovPath, sourceRoot = "src"] = process.argv.slice(2);
 if (!lcovPath) throw new Error("Usage: bun scripts/crap-check.ts coverage/lcov.info src");
 
@@ -56,8 +58,8 @@ function walk(dir: string): string[] {
 function metricsForFile(file: string): FnMetric[] {
   const ast = parse(readFileSync(file, "utf8"), { sourceType: "module", plugins: ["typescript"] });
   const metrics: FnMetric[] = [];
-  traverse(ast, {
-    Function(path) {
+  traverseAst(ast, {
+    Function(path: any) {
       metrics.push({ file, line: path.node.loc?.start.line ?? 1, name: functionName(path), complexity: complexity(path) });
     }
   });

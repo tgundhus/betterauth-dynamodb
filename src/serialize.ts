@@ -1,5 +1,5 @@
-import type { SidecarItem, StoredItem, TtlOptions } from "./types";
-import { entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "./keys";
+import { entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "./keys.js";
+import type { SidecarItem, StoredItem, TtlOptions } from "./types.js";
 import { randomUUID } from "node:crypto";
 
 export const REVISION_ATTRIBUTE = "__betterAuthDynamoDBRevision";

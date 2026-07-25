@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for considering a contribution. This project is being prepared as a public Better Auth DynamoDB adapter, so changes should be small, tested, and explicit about DynamoDB trade-offs.
+Thanks for considering a contribution. This project is being prepared as a restricted/private npm package for a Better Auth DynamoDB adapter, so changes should be small, tested, and explicit about DynamoDB trade-offs.
 
 ## Local workflow
 

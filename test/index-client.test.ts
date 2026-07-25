@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { createDocumentClient, normalizeOptions } from "../src/client";
-import { DynamoDBAdapterError, dynamoDBAdapter } from "../src/index";
-import { REVISION_ATTRIBUTE } from "../src/serialize";
+import { createDocumentClient, normalizeOptions } from "../src/client.js";
+import { DynamoDBAdapterError, dynamoDBAdapter } from "../src/index.js";
+import { REVISION_ATTRIBUTE } from "../src/serialize.js";
 
 describe("public adapter and client helpers", () => {
   it("normalizes option defaults and builds a document client", () => {

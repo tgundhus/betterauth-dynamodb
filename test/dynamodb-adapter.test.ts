@@ -1,11 +1,11 @@
 import { ConditionalCheckFailedException } from "@aws-sdk/client-dynamodb";
 import { GetCommand, QueryCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { describe, expect, it, vi } from "vitest";
-import { DynamoDBStore } from "../src/dynamodb-adapter";
-import { DynamoDBConflictError, UnsupportedQueryError } from "../src/errors";
-import { entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../src/keys";
-import { REVISION_ATTRIBUTE } from "../src/serialize";
-import type { CleanedWhere } from "../src/types";
+import { DynamoDBStore } from "../src/dynamodb-adapter.js";
+import { DynamoDBConflictError, UnsupportedQueryError } from "../src/errors.js";
+import { entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../src/keys.js";
+import { REVISION_ATTRIBUTE } from "../src/serialize.js";
+import type { CleanedWhere } from "../src/types.js";
 
 const eq = (field: string, value: unknown): CleanedWhere => ({ field, value: value as never, operator: "eq", connector: "AND", mode: "sensitive" });
 const rev = { [REVISION_ATTRIBUTE]: "rev-1" };

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildCondition, buildUpdateExpression } from "../src/expressions";
+import { buildCondition, buildUpdateExpression } from "../src/expressions.js";
 
 describe("expression builders", () => {
   it("builds condition and update expressions", () => {

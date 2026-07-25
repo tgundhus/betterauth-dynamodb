@@ -7,12 +7,12 @@ import {
   type DynamoDBDocumentClient
 } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
-import { createDocumentClient, normalizeOptions } from "./client";
-import { DynamoDBConflictError, isConditionalCheckFailed, isConditionalTransactionCanceled } from "./errors";
-import { entitySk, indexPk, modelPk } from "./keys";
-import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, revisionOf, stripUndefined, toIndexSidecars, toStoredItem, toUniqueLocks, ttlAttribute } from "./serialize";
-import type { BetterAuthDynamoDBOptions, CleanedWhere, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types";
-import { eqWhere, firstEquality, matchesWhere, planQuery } from "./where";
+import { createDocumentClient, normalizeOptions } from "./client.js";
+import { DynamoDBConflictError, isConditionalCheckFailed, isConditionalTransactionCanceled } from "./errors.js";
+import { entitySk, indexPk, modelPk } from "./keys.js";
+import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, revisionOf, stripUndefined, toIndexSidecars, toStoredItem, toUniqueLocks, ttlAttribute } from "./serialize.js";
+import type { BetterAuthDynamoDBOptions, CleanedWhere, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types.js";
+import { eqWhere, firstEquality, matchesWhere, planQuery } from "./where.js";
 
 const MAX_TRANSACT_ITEMS = 100;
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { UnsupportedQueryError } from "../src/errors";
-import { matchesWhere, planQuery } from "../src/where";
-import type { CleanedWhere } from "../src/types";
+import { UnsupportedQueryError } from "../src/errors.js";
+import type { CleanedWhere } from "../src/types.js";
+import { matchesWhere, planQuery } from "../src/where.js";
 
 const clause = (field: string, operator: CleanedWhere["operator"], value: CleanedWhere["value"]): CleanedWhere => ({ field, operator, value, connector: "AND", mode: "sensitive" });
 

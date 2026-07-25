@@ -10,10 +10,10 @@ import { DynamoDBDocumentClient, GetCommand, ScanCommand, TransactWriteCommand }
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
-import { DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../../src";
-import { entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../../src/keys";
-import { REVISION_ATTRIBUTE } from "../../src/serialize";
-import type { BetterAuthDynamoDBOptions } from "../../src";
+import { DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../../src/index.js";
+import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
+import { entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../../src/keys.js";
+import { REVISION_ATTRIBUTE } from "../../src/serialize.js";
 
 const IMAGE = "amazon/dynamodb-local:2.6.1";
 const REGION = "us-east-1";

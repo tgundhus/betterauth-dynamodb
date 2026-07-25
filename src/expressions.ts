@@ -1,5 +1,5 @@
-import type { CleanedWhere } from "./types";
-import { compareValues } from "./where";
+import type { CleanedWhere } from "./types.js";
+import { compareValues } from "./where.js";
 
 export interface ExpressionBuild {
   expression: string;

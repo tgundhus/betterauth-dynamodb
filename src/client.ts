@@ -1,8 +1,8 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import type { DynamoDBClientConfig } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
-import { DynamoDBAdapterError } from "./errors";
-import type { BetterAuthDynamoDBOptions } from "./types";
+import { DynamoDBAdapterError } from "./errors.js";
+import type { BetterAuthDynamoDBOptions } from "./types.js";
 
 export function createDocumentClient(options: BetterAuthDynamoDBOptions): DynamoDBDocumentClient {
   if (options.client) return options.client;

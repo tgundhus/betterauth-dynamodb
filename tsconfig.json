@@ -1,13 +1,14 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "ES2022",
-    "moduleResolution": "Bundler",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
     "strict": true,
     "declaration": true,
     "sourceMap": true,
     "declarationMap": true,
     "exactOptionalPropertyTypes": true,
+    "esModuleInterop": true,
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
     "types": ["node", "vitest/globals"]

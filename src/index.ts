@@ -1,9 +1,9 @@
 import { createAdapterFactory } from "better-auth/adapters";
-import { DynamoDBStore } from "./dynamodb-adapter";
-import type { BetterAuthDynamoDBOptions } from "./types";
+import { DynamoDBStore } from "./dynamodb-adapter.js";
+import type { BetterAuthDynamoDBOptions } from "./types.js";
 
-export type { BetterAuthDynamoDBOptions, TtlOptions } from "./types";
-export { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError } from "./errors";
+export type { BetterAuthDynamoDBOptions, TtlOptions } from "./types.js";
+export { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError } from "./errors.js";
 
 export function dynamoDBAdapter(adapterOptions: BetterAuthDynamoDBOptions) {
   return createAdapterFactory({
