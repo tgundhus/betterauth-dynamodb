@@ -46,9 +46,12 @@ export const auth = betterAuth({
     client: dynamo,
     ttl: { fields: { session: "expiresAt", verification: "expiresAt" } }
   }),
+  verification: { disableCleanup: true },
   emailAndPassword: { enabled: true }
 });
 ```
+
+When the `verification` model uses adapter-managed TTL, disable Better Auth's verification cleanup as shown above. Otherwise Better Auth can issue a range-only `deleteMany` such as `expiresAt < now`, which this adapter rejects by default because it would require a hidden table/model scan.
 
 For local development you may pass `region`, `endpoint`, and/or `dynamoDBClientConfig` instead of `client`. Production serverless apps should usually inject the client.
 
@@ -92,9 +95,12 @@ export const auth = betterAuth({
     client: dynamo,
     ttl: { fields: { session: "expiresAt", verification: "expiresAt" } }
   }),
+  verification: { disableCleanup: true },
   emailAndPassword: { enabled: true }
 });
 ```
+
+For email OTP sign-in or other flows where verification rows expire through DynamoDB TTL, keep `verification.disableCleanup: true` in the Better Auth config. Without it, Better Auth attempts to clean verification rows with a range-only `deleteMany(expiresAt < now)`, and the adapter rejects that no-key access pattern under its no-hidden-scan policy.
 
 Provision and link a DynamoDB table from your SST config. No GSIs are required for the current sidecar-index design:
 
