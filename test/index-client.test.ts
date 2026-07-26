@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { createDocumentClient, normalizeOptions } from "../src/client.js";
-import { DynamoDBAdapterError, DynamoDBConflictError, dynamoDBAdapter } from "../src/index.js";
+import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../src/index.js";
 import { uniquePk, valueSk } from "../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../src/serialize.js";
 
@@ -82,5 +82,12 @@ describe("public adapter and client helpers", () => {
 
     const command = send.mock.calls[1]?.[0] as TransactWriteCommand;
     expect(command.input.TransactItems).toContainEqual(expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ pk: uniquePk("app_user", "email_address"), sk: valueSk("same@example.com", "") }) }) }));
+  });
+
+  it("rejects experimental native joins while leaving fallback joins to Better Auth", async () => {
+    const send = vi.fn(async () => ({ Items: [] }));
+    const adapter = dynamoDBAdapter({ tableName: "auth", client: { send } as never })({ secret: "x", experimental: { joins: true }, emailAndPassword: { enabled: true } } as never);
+
+    await expect(adapter.findMany({ model: "session", where: [{ field: "userId", value: "u1" }], limit: 1, join: { user: true } } as never)).rejects.toBeInstanceOf(UnsupportedQueryError);
   });
 });

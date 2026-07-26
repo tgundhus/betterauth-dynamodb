@@ -118,6 +118,24 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(rawRowsByModel("_unique_session")).resolves.toHaveLength(0);
   });
 
+  it("allows exactly one concurrent consumeOne winner and one null loser", async () => {
+    const adapter = adapterFor({ client: docClient, uniqueFields: { verification: ["token"] } });
+    await create(adapter, "verification", { id: "v1", token: "tok", identifier: "email" });
+    const barrier = new ReadBarrier(2);
+    const concurrentAdapter = adapterFor({ client: clientWithReadBarrier(barrier, modelPk("verification"), entitySk("v1")) });
+
+    const results = await Promise.all([
+      concurrentAdapter.consumeOne({ model: "verification", where: [eq("id", "v1"), eq("token", "tok")] }),
+      concurrentAdapter.consumeOne({ model: "verification", where: [eq("id", "v1"), eq("token", "tok")] })
+    ]);
+
+    expect(results.filter(Boolean)).toEqual([expect.objectContaining({ id: "v1", token: "tok" })]);
+    expect(results.filter((result) => result === null)).toHaveLength(1);
+    await expect(rawRow(modelPk("verification"), entitySk("v1"))).resolves.toBeUndefined();
+    await expect(rawRowsByModel("_index_verification")).resolves.toHaveLength(0);
+    await expect(rawRowsByModel("_unique_verification")).resolves.toHaveLength(0);
+  });
+
   it("increments using a fresh revision and rejects concurrent stale revision mutations", async () => {
     const adapter = adapterFor({ client: docClient });
     await create(adapter, "rateLimit", { id: "r1", key: "ip", count: 1 });
@@ -135,6 +153,29 @@ describe("DynamoDB Local adapter integration", () => {
     ]);
     expect(concurrent.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(concurrent.filter((result) => result.status === "rejected")).toHaveLength(1);
+  });
+
+  it("uses atomic ADD for concurrent incrementOne, signed deltas, guard nulls, and sidecars", async () => {
+    const adapter = adapterFor({ client: docClient });
+    await create(adapter, "rateLimit", { id: "r2", key: "ip2", count: 1 });
+    await expect(adapter.incrementOne({ model: "rateLimit", where: [eq("id", "r2")], increment: { count: -1 } })).resolves.toMatchObject({ id: "r2", count: 0 });
+    await expect(adapter.findOne({ model: "rateLimit", where: [eq("count", 1)] })).resolves.toBeNull();
+    await expect(adapter.findOne({ model: "rateLimit", where: [eq("count", 0)] })).resolves.toMatchObject({ id: "r2" });
+
+    const barrier = new ReadBarrier(2);
+    const concurrentAdapter = adapterFor({ client: clientWithReadBarrier(barrier, modelPk("rateLimit"), entitySk("r2")) });
+    const results = await Promise.all([
+      concurrentAdapter.incrementOne({ model: "rateLimit", where: [eq("id", "r2"), eq("key", "ip2")], increment: { count: 1 } }),
+      concurrentAdapter.incrementOne({ model: "rateLimit", where: [eq("id", "r2"), eq("key", "ip2")], increment: { count: 1 } })
+    ]);
+
+    expect(results.filter(Boolean)).toEqual([expect.objectContaining({ id: "r2", count: 1 })]);
+    expect(results.filter((result) => result === null)).toHaveLength(1);
+    await expect(adapter.findOne({ model: "rateLimit", where: [eq("id", "r2")] })).resolves.toMatchObject({ count: 1 });
+    await expect(adapter.findOne({ model: "rateLimit", where: [eq("count", 0)] })).resolves.toBeNull();
+    await expect(adapter.findOne({ model: "rateLimit", where: [eq("count", 1)] })).resolves.toMatchObject({ id: "r2" });
+    await expect(adapter.incrementOne({ model: "rateLimit", where: [eq("id", "r2")], increment: { count: 0 } })).resolves.toMatchObject({ id: "r2", count: 1 });
+    await expect(adapter.incrementOne({ model: "rateLimit", where: [eq("id", "r2"), eq("key", "other")], increment: { count: 1 } })).resolves.toBeNull();
   });
 
   it.each([undefined, false] as const)("keeps numeric ttl fields visible and unexpired when adapter TTL is %s", async (ttl) => {
@@ -175,6 +216,14 @@ describe("DynamoDB Local adapter integration", () => {
       expect.objectContaining({ id: "u1" })
     ]);
     await expect(adapter.count({ model: "user", where: [contains("email", "@example.com")] })).resolves.toBe(3);
+  });
+
+  it("sorts numeric fields numerically in DynamoDB-backed findMany", async () => {
+    const adapter = adapterFor({ client: docClient, unsafeAllowScan: true });
+    await create(adapter, "plugin", { id: "p1", externalId: "e1", kind: "score", ttl: 10 });
+    await create(adapter, "plugin", { id: "p2", externalId: "e2", kind: "score", ttl: 2 });
+
+    await expect(adapter.findMany({ model: "plugin", where: [eq("kind", "score")], limit: 2, sortBy: { field: "ttl", direction: "asc" } })).resolves.toEqual([expect.objectContaining({ id: "p2", ttl: 2 }), expect.objectContaining({ id: "p1", ttl: 10 })]);
   });
 
   it("rejects hidden scans and accepts long delimiter-containing values", async () => {

@@ -8,7 +8,7 @@ import {
 } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
 import { createDocumentClient, normalizeOptions } from "./client.js";
-import { DynamoDBConflictError, isConditionalCheckFailed, isConditionalTransactionCanceled } from "./errors.js";
+import { DynamoDBAdapterError, DynamoDBConflictError, isConditionalCheckFailed, isConditionalTransactionCanceled, transactionCancellationCodes } from "./errors.js";
 import { entitySk, indexPk, modelPk } from "./keys.js";
 import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, revisionOf, stripUndefined, toIndexSidecars, toStoredItem, toUniqueLocks, ttlAttribute } from "./serialize.js";
 import type { BetterAuthDynamoDBOptions, CleanedWhere, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types.js";
@@ -91,7 +91,7 @@ export class DynamoDBStore {
       await this.transactDelete(target);
       return fromStoredItem<T>(target, this.options.ttl);
     } catch (error) {
-      if (isWriteRace(error)) throw conflictError("consumeOne", error);
+      if (isWriteRace(error)) return null;
       throw error;
     }
   }
@@ -99,14 +99,15 @@ export class DynamoDBStore {
   async incrementOne<T>(model: string, where: CleanedWhere[], increment: Record<string, number>, set?: Record<string, unknown>): Promise<T | null> {
     const target = await this.targetByWhere(model, where);
     if (!target) return null;
-    const next = applyIncrement(target.entity, increment, stripUndefined(set ?? {}));
+    const cleanedSet = stripUndefined(set ?? {});
+    validateIncrementInput(increment);
+    const next = applyIncrement(target.entity, increment, cleanedSet);
     const item = toStoredItem(model, next, this.options.ttl);
     try {
-      await this.transactReplace(model, target, item);
+      await this.transactIncrement(model, target, item, increment, cleanedSet);
       return fromStoredItem<T>(item, this.options.ttl);
     } catch (error) {
-      if (isWriteRace(error)) throw conflictError("incrementOne", error);
-      throw error;
+      return handleIncrementError(error);
     }
   }
 
@@ -190,6 +191,14 @@ export class DynamoDBStore {
     await this.client.send(new TransactWriteCommand(transactInput(actions)));
   }
 
+  private async transactIncrement(model: string, oldItem: StoredItem, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>): Promise<void> {
+    const oldSidecars = [...this.sidecars(model, oldItem.entity), ...this.uniqueLocks(model, oldItem.entity)];
+    const newSidecars = [...this.sidecars(model, newItem.entity), ...this.uniqueLocks(model, newItem.entity)];
+    const actions = [incrementUpdateOf(this.options.tableName, oldItem, newItem, increment, set, this.options.ttl), ...removedSidecars(oldSidecars, newSidecars).map((item) => deleteOf(this.options.tableName, item)), ...addedSidecars(oldSidecars, newSidecars).map((item) => putNewOf(this.options.tableName, item)), ...retainedSidecars(oldSidecars, newSidecars).flatMap(([oldSidecar, newSidecar]) => ttlUpdateOf(this.options.tableName, oldSidecar, newSidecar, this.options.ttl))];
+    assertTransactionActions(actions);
+    await this.client.send(new TransactWriteCommand(transactInput(actions)));
+  }
+
   private async queryAllSidecars(model: string, clause: CleanedWhere): Promise<SidecarItem[]> {
     const command = sidecarQuery(this.options.tableName, model, clause, this.options.pageSize);
     return drainPages<SidecarItem>(async (key) => pageOf<SidecarItem>(await this.client.send(new QueryCommand({ ...command, ExclusiveStartKey: key }))), this.options.maxPages);
@@ -233,7 +242,23 @@ function selectWindow(rows: StoredItem[], limit: number, offset: number, sortBy?
 
 function compareSort(a: StoredItem, b: StoredItem, sortBy: { field: string; direction: "asc" | "desc" }): number {
   const direction = sortBy.direction === "desc" ? -1 : 1;
-  return String(a[sortBy.field] ?? "").localeCompare(String(b[sortBy.field] ?? "")) * direction;
+  return compareSortValues(a[sortBy.field], b[sortBy.field]) * direction;
+}
+
+function compareSortValues(left: unknown, right: unknown): number {
+  const numeric = numericSortValue(left, right);
+  if (numeric !== null) return numeric;
+  const dated = dateSortValue(left, right);
+  if (dated !== null) return dated;
+  return String(left ?? "").localeCompare(String(right ?? ""));
+}
+
+function numericSortValue(left: unknown, right: unknown): number | null {
+  return typeof left === "number" && typeof right === "number" ? left - right : null;
+}
+
+function dateSortValue(left: unknown, right: unknown): number | null {
+  return left instanceof Date && right instanceof Date ? left.getTime() - right.getTime() : null;
 }
 
 function deleteOf(tableName: string, item: SidecarItem) {
@@ -269,6 +294,86 @@ function ownerValues(item: SidecarItem) {
   return { ":ownerPk": item.ownerPk, ":ownerSk": item.ownerSk };
 }
 
+function incrementUpdateOf(tableName: string, oldItem: StoredItem, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>, ttl?: false | TtlOptions) {
+  const expression = incrementUpdateExpression(oldItem, newItem, increment, set, ttl);
+  return { Update: { TableName: tableName, Key: keyOf(oldItem), ConditionExpression: expression.condition.expression, UpdateExpression: expression.update, ExpressionAttributeNames: expression.names, ExpressionAttributeValues: expression.values, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
+}
+
+function incrementUpdateExpression(oldItem: StoredItem, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>, ttl?: false | TtlOptions) {
+  const condition = revisionCondition(oldItem);
+  const names: Record<string, string> = { ...condition.names, "#entity": "entity", "#revision": REVISION_ATTRIBUTE, "#model": "model", "#id": "id" };
+  const values: Record<string, unknown> = { ...condition.values, ":entity": newItem.entity, ":newRevision": newItem[REVISION_ATTRIBUTE], ":model": newItem.model, ":id": newItem.id };
+  const addable = addableIncrementFields(oldItem.entity, increment);
+  const setParts = ["#entity = :entity", "#revision = :newRevision", "#model = :model", "#id = :id", ...setAttributeParts(oldItem.entity, newItem, increment, set, names, values), ...optionalMetadataSetParts(newItem, names, values, ttl)];
+  const removeParts = optionalMetadataRemoveParts(oldItem, newItem, names, ttl);
+  const addParts = incrementAttributeParts(addable, names, values);
+  return { condition, names, values, update: [setParts.length ? `SET ${setParts.join(", ")}` : "", removeParts.length ? `REMOVE ${removeParts.join(", ")}` : "", addParts.length ? `ADD ${addParts.join(", ")}` : ""].filter(Boolean).join(" ") };
+}
+
+function setAttributeParts(oldEntity: Record<string, unknown>, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>, names: Record<string, string>, values: Record<string, unknown>): string[] {
+  const fields = new Set([...Object.keys(set), ...nonAddableIncrementFields(oldEntity, increment)]);
+  return [...fields].filter((field) => !isAddableIncrementField(oldEntity, increment, field) && field in newItem).map((field, index) => {
+    const name = `#set${index}`;
+    const value = `:set${index}`;
+    names[name] = field;
+    values[value] = newItem[field];
+    return `${name} = ${value}`;
+  });
+}
+
+function incrementAttributeParts(increment: Record<string, number>, names: Record<string, string>, values: Record<string, unknown>): string[] {
+  return Object.entries(increment).map(([field, amount], index) => {
+    const name = `#inc${index}`;
+    const value = `:inc${index}`;
+    names[name] = field;
+    values[value] = amount;
+    return `${name} ${value}`;
+  });
+}
+
+function addableIncrementFields(entity: Record<string, unknown>, increment: Record<string, number>): Record<string, number> {
+  return Object.fromEntries(Object.entries(increment).filter(([field]) => isAddableNumber(entity[field])));
+}
+
+function nonAddableIncrementFields(entity: Record<string, unknown>, increment: Record<string, number>): string[] {
+  return Object.keys(increment).filter((field) => !isAddableNumber(entity[field]));
+}
+
+function isAddableIncrementField(entity: Record<string, unknown>, increment: Record<string, number>, field: string): boolean {
+  return field in increment && isAddableNumber(entity[field]);
+}
+
+function isAddableNumber(value: unknown): boolean {
+  return value === undefined || typeof value === "number";
+}
+
+function optionalMetadataSetParts(newItem: StoredItem, names: Record<string, string>, values: Record<string, unknown>, ttl?: false | TtlOptions): string[] {
+  const parts: string[] = [];
+  if (newItem.createdAtSort !== undefined) parts.push(assignMetadata("#createdAtSort", "createdAtSort", ":createdAtSort", newItem.createdAtSort, names, values));
+  const ttlName = ttlAttribute(ttl);
+  if (newItem[ttlName] !== undefined) parts.push(assignMetadata("#ttl", ttlName, ":ttl", newItem[ttlName], names, values));
+  return parts;
+}
+
+function optionalMetadataRemoveParts(oldItem: StoredItem, newItem: StoredItem, names: Record<string, string>, ttl?: false | TtlOptions): string[] {
+  const parts: string[] = [];
+  if (oldItem.createdAtSort !== undefined && newItem.createdAtSort === undefined) parts.push(removeMetadata("#createdAtSort", "createdAtSort", names));
+  const ttlName = ttlAttribute(ttl);
+  if (oldItem[ttlName] !== undefined && newItem[ttlName] === undefined) parts.push(removeMetadata("#ttl", ttlName, names));
+  return parts;
+}
+
+function assignMetadata(nameToken: string, name: string, valueToken: string, value: unknown, names: Record<string, string>, values: Record<string, unknown>): string {
+  names[nameToken] = name;
+  values[valueToken] = value;
+  return `${nameToken} = ${valueToken}`;
+}
+
+function removeMetadata(nameToken: string, name: string, names: Record<string, string>): string {
+  names[nameToken] = name;
+  return nameToken;
+}
+
 function assertTransactionActions(actions: NonNullable<TransactWriteCommandInput["TransactItems"]>): void {
   assertTransactionSize(actions.length);
   assertNoDuplicateActions(actions);
@@ -288,7 +393,19 @@ function assertNoDuplicateActions(actions: NonNullable<TransactWriteCommandInput
 }
 
 function applyIncrement(entity: Record<string, unknown>, increment: Record<string, number>, set: Record<string, unknown>): Record<string, unknown> {
-  return Object.entries(increment).reduce((acc, [field, amount]) => ({ ...acc, [field]: Number(acc[field] ?? 0) + amount }), { ...entity, ...set });
+  return Object.entries(increment).reduce((acc, [field, amount]) => ({ ...acc, [field]: incrementBase(entity[field]) + amount }), { ...entity, ...set });
+}
+
+function incrementBase(value: unknown): number {
+  return typeof value === "number" ? value : 0;
+}
+
+function validateIncrementInput(increment: Record<string, number>): void {
+  for (const [field, amount] of Object.entries(increment)) validateIncrementField(field, amount);
+}
+
+function validateIncrementField(field: string, amount: number): void {
+  if (!Number.isFinite(amount)) throw new DynamoDBAdapterError(`Better Auth DynamoDB incrementOne delta for field "${field}" must be a finite number.`);
 }
 
 function sidecarKey(item: SidecarItem): string {
@@ -315,6 +432,17 @@ function retainedSidecars(oldItems: SidecarItem[], newItems: SidecarItem[]): (re
 
 function isWriteRace(error: unknown): boolean {
   return isConditionalCheckFailed(error) || isConditionalTransactionCanceled(error);
+}
+
+function isStaleTargetRace(error: unknown): boolean {
+  if (isConditionalCheckFailed(error)) return true;
+  return transactionCancellationCodes(error)[0] === "ConditionalCheckFailed";
+}
+
+function handleIncrementError(error: unknown): null {
+  if (isStaleTargetRace(error)) return null;
+  if (isWriteRace(error)) throw conflictError("incrementOne", error);
+  throw error;
 }
 
 function actionKey(action: NonNullable<TransactWriteCommandInput["TransactItems"]>[number]): string {

@@ -31,6 +31,10 @@ export function isConditionalTransactionCanceled(error: unknown): boolean {
   return isTransactionCanceled(error) && cancellationCodes(error).includes("ConditionalCheckFailed");
 }
 
+export function transactionCancellationCodes(error: unknown): string[] {
+  return cancellationCodes(error);
+}
+
 function cancellationCodes(error: unknown): string[] {
   if (!hasCancellationReasons(error)) return [];
   return error.CancellationReasons.map((reason) => reason.Code).filter((code): code is string => typeof code === "string");

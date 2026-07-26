@@ -1,5 +1,6 @@
 import { createAdapterFactory } from "better-auth/adapters";
 import { DynamoDBStore } from "./dynamodb-adapter.js";
+import { UnsupportedQueryError } from "./errors.js";
 import type { BetterAuthDynamoDBOptions } from "./types.js";
 
 export type { BetterAuthDynamoDBOptions, TtlOptions } from "./types.js";
@@ -22,9 +23,14 @@ export function dynamoDBAdapter(adapterOptions: BetterAuthDynamoDBOptions) {
       const store = new DynamoDBStore({ ...adapterOptions, uniqueFields: mergeUniqueFields(schemaUniqueFields, adapterOptions.uniqueFields) });
       const adapter: any = {
         create: <T extends Record<string, unknown>>(data: { model: string; data: T }) => store.create(data.model, data.data),
-        findOne: <T>(data: { model: string; where: any[] }) => store.findOne<T>(data.model, data.where),
-        findMany: <T>(data: { model: string; where?: any[]; limit: number; offset?: number; sortBy?: { field: string; direction: "asc" | "desc" } }) =>
-          store.findMany<T>(data.model, data.where, data.limit, data.offset, data.sortBy),
+        findOne: <T>(data: { model: string; where: any[]; join?: Record<string, unknown> }) => {
+          assertNoNativeJoin(data.join);
+          return store.findOne<T>(data.model, data.where);
+        },
+        findMany: <T>(data: { model: string; where?: any[]; limit: number; offset?: number; sortBy?: { field: string; direction: "asc" | "desc" }; join?: Record<string, unknown> }) => {
+          assertNoNativeJoin(data.join);
+          return store.findMany<T>(data.model, data.where, data.limit, data.offset, data.sortBy);
+        },
         count: (data: { model: string; where?: any[] }) => store.count(data.model, data.where),
         update: <T>(data: { model: string; where: any[]; update: Record<string, unknown> }) => store.update<T>(data.model, data.where, data.update),
         updateMany: (data: { model: string; where: any[]; update: Record<string, unknown> }) => store.updateMany(data.model, data.where, data.update),
@@ -68,4 +74,9 @@ function uniqueFieldEntry(entry: [string, AdapterSchema[string]], getModelName: 
 
 function hasUniqueFields(entry: [string, string[]]): boolean {
   return entry[1].length > 0;
+}
+
+function assertNoNativeJoin(join: Record<string, unknown> | undefined): void {
+  if (!join || Object.keys(join).length === 0) return;
+  throw new UnsupportedQueryError("Better Auth experimental native joins are not supported by the DynamoDB adapter. Disable experimental.joins so Better Auth can use its fallback join queries.");
 }

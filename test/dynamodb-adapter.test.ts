@@ -2,7 +2,7 @@ import { ConditionalCheckFailedException } from "@aws-sdk/client-dynamodb";
 import { GetCommand, QueryCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { describe, expect, it, vi } from "vitest";
 import { DynamoDBStore } from "../src/dynamodb-adapter.js";
-import { DynamoDBConflictError, UnsupportedQueryError } from "../src/errors.js";
+import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError } from "../src/errors.js";
 import { entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../src/serialize.js";
 import type { CleanedWhere } from "../src/types.js";
@@ -138,25 +138,39 @@ describe("DynamoDBStore", () => {
     expect((doc.send.mock.calls[1]?.[0] as TransactWriteCommand).input.TransactItems?.[0]?.Delete?.ReturnValuesOnConditionCheckFailure).toBe("ALL_OLD");
   });
 
-  it("surfaces consumeOne races that fail after the target read", async () => {
+  it("returns null for consumeOne races that fail after the target read", async () => {
     const doc = client([{ pk: modelPk("verification"), sk: entitySk("v1"), id: "v1", entity: { id: "v1" }, ...rev }]);
     doc.send.mockImplementation(async (command) => {
       if (command instanceof GetCommand) return { Item: { pk: modelPk("verification"), sk: entitySk("v1"), id: "v1", entity: { id: "v1" }, ...rev } };
       throw new ConditionalCheckFailedException({ message: "race", $metadata: {} });
     });
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
-    await expect(store.consumeOne("verification", [eq("id", "v1")])).rejects.toBeInstanceOf(DynamoDBConflictError);
+    await expect(store.consumeOne("verification", [eq("id", "v1")])).resolves.toBeNull();
   });
 
-  it("builds atomic incrementOne with guard and all-new return", async () => {
+  it("propagates unexpected consumeOne AWS failures", async () => {
+    const row = { pk: modelPk("verification"), sk: entitySk("v1"), id: "v1", entity: { id: "v1" }, ...rev };
+    const throttled = Object.assign(new Error("throttled"), { name: "TransactionCanceledException", CancellationReasons: [{ Code: "ProvisionedThroughputExceeded" }] });
+    const doc = client([row]);
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof GetCommand) return { Item: row };
+      throw throttled;
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
+    await expect(store.consumeOne("verification", [eq("id", "v1")])).rejects.toBe(throttled);
+  });
+
+  it("builds transactional native ADD incrementOne with guard and sidecar maintenance", async () => {
     const doc = client([{ pk: modelPk("rateLimit"), sk: entitySk("r1"), id: "r1", count: 1, entity: { id: "r1", count: 1 }, ...rev }]);
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
     await expect(store.incrementOne("rateLimit", [eq("id", "r1")], { count: 1 }, { updatedAt: "now" })).resolves.toEqual({ id: "r1", count: 2, updatedAt: "now" });
     const command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
-    expect(command.input.TransactItems?.[0]?.Put?.Item).toMatchObject({ count: 2, entity: { id: "r1", count: 2, updatedAt: "now" } });
-    expect(command.input.TransactItems?.[0]?.Put?.ConditionExpression).toBe("attribute_exists(#pk) AND #revision = :revision");
-    expect(command.input.TransactItems?.[0]?.Put?.ExpressionAttributeValues).toEqual({ ":revision": "rev-1" });
-    expect(command.input.TransactItems?.[0]?.Put?.Item?.[REVISION_ATTRIBUTE]).not.toBe("rev-1");
+    expect(command.input.TransactItems?.[0]?.Update?.UpdateExpression).toContain("ADD #inc0 :inc0");
+    expect(command.input.TransactItems?.[0]?.Update?.UpdateExpression).toContain("SET #entity = :entity");
+    expect(command.input.TransactItems?.[0]?.Update?.ConditionExpression).toBe("attribute_exists(#pk) AND #revision = :revision");
+    expect(command.input.TransactItems?.[0]?.Update?.ExpressionAttributeValues).toMatchObject({ ":revision": "rev-1", ":inc0": 1, ":entity": { id: "r1", count: 2, updatedAt: "now" } });
+    expect(command.input.TransactItems?.[0]?.Update?.ExpressionAttributeValues?.[":newRevision"]).not.toBe("rev-1");
+    expect(command.input.TransactItems).toEqual(expect.arrayContaining([expect.objectContaining({ Delete: expect.objectContaining({ Key: { pk: indexPk("rateLimit", "count", 1), sk: indexSk("r1") } }) }), expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ pk: indexPk("rateLimit", "count", 2), sk: indexSk("r1") }) }) })]));
   });
 
   it("increments a missing numeric field with a valid snapshot guard", async () => {
@@ -164,7 +178,77 @@ describe("DynamoDBStore", () => {
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
     await expect(store.incrementOne("rateLimit", [eq("id", "r1")], { count: 1 })).resolves.toEqual({ id: "r1", count: 1 });
     const command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
-    expect(command.input.TransactItems?.[0]?.Put?.ExpressionAttributeValues).toEqual({ ":revision": "rev-1" });
+    expect(command.input.TransactItems?.[0]?.Update?.ExpressionAttributeValues).toMatchObject({ ":revision": "rev-1", ":inc0": 1 });
+  });
+
+  it("supports signed increment deltas and returns null for stale increment guards", async () => {
+    const row = { pk: modelPk("rateLimit"), sk: entitySk("r1"), id: "r1", count: 3, entity: { id: "r1", count: 3 }, ...rev };
+    const stale = Object.assign(new Error("stale"), { name: "TransactionCanceledException", CancellationReasons: [{ Code: "ConditionalCheckFailed" }] });
+    const doc = client([row]);
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof GetCommand) return { Item: row };
+      throw stale;
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
+    await expect(store.incrementOne("rateLimit", [eq("id", "r1")], { count: -2 })).resolves.toBeNull();
+    const command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
+    expect(command.input.TransactItems?.[0]?.Update?.ExpressionAttributeValues).toMatchObject({ ":inc0": -2, ":entity": { id: "r1", count: 1 } });
+  });
+
+  it("propagates unexpected increment AWS failures", async () => {
+    const row = { pk: modelPk("rateLimit"), sk: entitySk("r1"), id: "r1", count: 1, entity: { id: "r1", count: 1 }, ...rev };
+    const throttled = Object.assign(new Error("throttled"), { name: "TransactionCanceledException", CancellationReasons: [{ Code: "ProvisionedThroughputExceeded" }] });
+    const doc = client([row]);
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof GetCommand) return { Item: row };
+      throw throttled;
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
+    await expect(store.incrementOne("rateLimit", [eq("id", "r1")], { count: 1 })).rejects.toBe(throttled);
+  });
+
+  it("surfaces increment unique-lock conflicts instead of treating later cancellation reasons as stale guards", async () => {
+    const row = { pk: modelPk("rateLimit"), sk: entitySk("r1"), id: "r1", count: 1, entity: { id: "r1", count: 1 }, ...rev };
+    const conflict = Object.assign(new Error("unique exists"), { name: "TransactionCanceledException", CancellationReasons: [{ Code: "None" }, { Code: "ConditionalCheckFailed" }] });
+    const doc = client([row]);
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof GetCommand) return { Item: row };
+      throw conflict;
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, uniqueFields: { rateLimit: ["count"] } });
+    await expect(store.incrementOne("rateLimit", [eq("id", "r1")], { count: 1 })).rejects.toBeInstanceOf(DynamoDBConflictError);
+  });
+
+  it("treats non-number current values as zero and avoids invalid ADD operands", async () => {
+    const row = { pk: modelPk("rateLimit"), sk: entitySk("r1"), id: "r1", count: "not-a-number", entity: { id: "r1", count: "not-a-number" }, ...rev };
+    const doc = client([row]);
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
+
+    await expect(store.incrementOne("rateLimit", [eq("id", "r1")], { count: 1 })).resolves.toEqual({ id: "r1", count: 1 });
+    const command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
+    expect(command.input.TransactItems?.[0]?.Update?.UpdateExpression).toContain("#set0 = :set0");
+    expect(command.input.TransactItems?.[0]?.Update?.UpdateExpression).not.toContain("ADD #inc0 :inc0");
+    expect(command.input.TransactItems?.[0]?.Update?.ExpressionAttributeValues).toMatchObject({ ":set0": 1, ":entity": { id: "r1", count: 1 } });
+  });
+
+  it("uses Better Auth fallback semantics when set overlaps increment fields", async () => {
+    const row = { pk: modelPk("rateLimit"), sk: entitySk("r1"), id: "r1", count: 1, entity: { id: "r1", count: 1 }, ...rev };
+    const doc = client([row]);
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
+
+    await expect(store.incrementOne("rateLimit", [eq("id", "r1")], { count: 1 }, { count: 10 })).resolves.toEqual({ id: "r1", count: 2 });
+    const command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
+    expect(command.input.TransactItems?.[0]?.Update?.UpdateExpression).toContain("ADD #inc0 :inc0");
+    expect(command.input.TransactItems?.[0]?.Update?.ExpressionAttributeValues).toMatchObject({ ":inc0": 1, ":entity": { id: "r1", count: 2 } });
+  });
+
+  it("rejects non-finite increment deltas before constructing a transactional update", async () => {
+    const row = { pk: modelPk("rateLimit"), sk: entitySk("r1"), id: "r1", entity: { id: "r1" }, ...rev };
+    const doc = client([row]);
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
+
+    await expect(store.incrementOne("rateLimit", [eq("id", "r1")], { visits: Number.NaN })).rejects.toBeInstanceOf(DynamoDBAdapterError);
+    expect(doc.send.mock.calls.filter((call) => call[0] instanceof TransactWriteCommand)).toHaveLength(0);
   });
 
   it("paginates sidecar queries before filtering, sorting, and slicing", async () => {
@@ -332,6 +416,17 @@ describe("DynamoDBStore", () => {
     await store.delete("user", [eq("id", "u1")]);
     await store.transactCreate([{ model: "user", data: { id: "u3" } }]);
     expect(doc.send.mock.calls.some((call) => call[0] instanceof TransactWriteCommand)).toBe(true);
+  });
+
+  it("sorts numeric sortBy values numerically", async () => {
+    const rows = [
+      { pk: modelPk("user"), sk: entitySk("u1"), id: "u1", score: 10, entity: { id: "u1", score: 10 }, ...rev },
+      { pk: modelPk("user"), sk: entitySk("u2"), id: "u2", score: 2, entity: { id: "u2", score: 2 }, ...rev }
+    ];
+    const doc = client(rows);
+    doc.send.mockImplementation(async (command) => (command instanceof ScanCommand ? { Items: rows } : {}));
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, unsafeAllowScan: true });
+    await expect(store.findMany("user", [], 10, 0, { field: "score", direction: "asc" })).resolves.toEqual([{ id: "u2", score: 2 }, { id: "u1", score: 10 }]);
   });
 
   it("fails early when sidecars would exceed the DynamoDB transaction item limit", async () => {
