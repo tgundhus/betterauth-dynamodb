@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { createDocumentClient, normalizeOptions } from "../src/client.js";
-import { DynamoDBAdapterError, dynamoDBAdapter } from "../src/index.js";
+import { DynamoDBAdapterError, DynamoDBConflictError, dynamoDBAdapter } from "../src/index.js";
+import { uniquePk, valueSk } from "../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../src/serialize.js";
 
 describe("public adapter and client helpers", () => {
@@ -35,5 +37,50 @@ describe("public adapter and client helpers", () => {
     await adapter.deleteMany({ model: "user", where: [{ field: "email", value: "a@example.com" }] });
     await adapter.consumeOne({ model: "user", where: [{ field: "id", value: "u" }] });
     await adapter.transaction(async () => "ok");
+  });
+
+  it.each([
+    ["model remapping", { modelName: "app_user" }, "app_user", "email"],
+    ["field remapping", { fields: { email: "email_address" } }, "user", "email_address"],
+    ["model and field remapping", { modelName: "app_user", fields: { email: "email_address" } }, "app_user", "email_address"]
+  ] as const)("derives unique locks from transformed schema names for %s", async (_label, userConfig, storedModel, storedField) => {
+    const send = vi.fn(async (command: unknown) => {
+      void command;
+      return {};
+    });
+    const doc = { send };
+    const adapter = dynamoDBAdapter({ tableName: "auth", client: doc as never })({ secret: "x", emailAndPassword: { enabled: true }, user: userConfig } as never);
+
+    await adapter.create({ model: "user", data: { id: "u1", email: "same@example.com", name: "Ada" }, forceAllowId: true });
+
+    const command = send.mock.calls[0]?.[0] as TransactWriteCommand;
+    expect(command.input.TransactItems).toContainEqual(expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ pk: uniquePk(storedModel, storedField), sk: valueSk("same@example.com", "") }) }) }));
+  });
+
+  it("treats manual uniqueFields as transformed DynamoDB model and field names", async () => {
+    const send = vi.fn(async (command: unknown) => {
+      void command;
+      return {};
+    });
+    const doc = { send };
+    const adapter = dynamoDBAdapter({ tableName: "auth", client: doc as never, uniqueFields: { app_user: ["handle"] } })({ secret: "x", user: { modelName: "app_user", additionalFields: { username: { type: "string", required: true, fieldName: "handle" } } } } as never);
+
+    await adapter.create({ model: "user", data: { id: "u1", name: "Ada", email: "a@example.com", emailVerified: true, username: "ada" }, forceAllowId: true });
+
+    const command = send.mock.calls[0]?.[0] as TransactWriteCommand;
+    expect(command.input.TransactItems).toContainEqual(expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ pk: uniquePk("app_user", "handle"), sk: valueSk("ada", "") }) }) }));
+    expect(command.input.TransactItems).not.toContainEqual(expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ pk: uniquePk("user", "username") }) }) }));
+  });
+
+  it("rejects duplicate creates through mapped schema unique locks", async () => {
+    const duplicate = Object.assign(new Error("duplicate"), { name: "TransactionCanceledException", CancellationReasons: [{ Code: "None" }, { Code: "ConditionalCheckFailed" }] });
+    const send = vi.fn().mockResolvedValueOnce({}).mockRejectedValueOnce(duplicate);
+    const adapter = dynamoDBAdapter({ tableName: "auth", client: { send } as never })({ secret: "x", emailAndPassword: { enabled: true }, user: { modelName: "app_user", fields: { email: "email_address" } } } as never);
+
+    await adapter.create({ model: "user", data: { id: "u1", email: "same@example.com", name: "Ada" }, forceAllowId: true });
+    await expect(adapter.create({ model: "user", data: { id: "u2", email: "same@example.com", name: "Grace" }, forceAllowId: true })).rejects.toBeInstanceOf(DynamoDBConflictError);
+
+    const command = send.mock.calls[1]?.[0] as TransactWriteCommand;
+    expect(command.input.TransactItems).toContainEqual(expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ pk: uniquePk("app_user", "email_address"), sk: valueSk("same@example.com", "") }) }) }));
   });
 });

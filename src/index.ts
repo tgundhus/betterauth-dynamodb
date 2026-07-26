@@ -17,8 +17,9 @@ export function dynamoDBAdapter(adapterOptions: BetterAuthDynamoDBOptions) {
       supportsNumericIds: false,
       transaction: false
     },
-    adapter: ({ schema }) => {
-      const store = new DynamoDBStore({ ...adapterOptions, uniqueFields: mergeUniqueFields(collectUniqueFields(schema), adapterOptions.uniqueFields) });
+    adapter: ({ schema, getModelName, getFieldName }) => {
+      const schemaUniqueFields = collectUniqueFields(schema, getModelName, getFieldName);
+      const store = new DynamoDBStore({ ...adapterOptions, uniqueFields: mergeUniqueFields(schemaUniqueFields, adapterOptions.uniqueFields) });
       const adapter: any = {
         create: <T extends Record<string, unknown>>(data: { model: string; data: T }) => store.create(data.model, data.data),
         findOne: <T>(data: { model: string; where: any[] }) => store.findOne<T>(data.model, data.where),
@@ -48,12 +49,21 @@ function mergeUniqueFields(...sources: (Record<string, string[]> | undefined)[])
   return merged;
 }
 
-function collectUniqueFields(schema: Record<string, { fields: Record<string, { unique?: boolean | undefined }> }>): Record<string, string[]> {
-  return Object.fromEntries(Object.entries(schema).map(uniqueFieldEntry).filter(hasUniqueFields));
+type AdapterSchema = Record<string, { fields: Record<string, { unique?: boolean | undefined }> }>;
+type ModelNameResolver = (model: string) => string;
+type FieldNameResolver = (input: { model: string; field: string }) => string;
+
+function collectUniqueFields(schema: AdapterSchema, getModelName: ModelNameResolver, getFieldName: FieldNameResolver): Record<string, string[]> {
+  return mergeUniqueEntries(Object.entries(schema).map((entry) => uniqueFieldEntry(entry, getModelName, getFieldName)).filter(hasUniqueFields));
 }
 
-function uniqueFieldEntry(entry: [string, { fields: Record<string, { unique?: boolean | undefined }> }]): [string, string[]] {
-  return [entry[0], Object.entries(entry[1].fields).filter((field) => field[1].unique).map((field) => field[0])];
+function mergeUniqueEntries(entries: [string, string[]][]): Record<string, string[]> {
+  return mergeUniqueFields(...entries.map(([model, fields]) => ({ [model]: fields })));
+}
+
+function uniqueFieldEntry(entry: [string, AdapterSchema[string]], getModelName: ModelNameResolver, getFieldName: FieldNameResolver): [string, string[]] {
+  const [model, table] = entry;
+  return [getModelName(model), Object.entries(table.fields).filter((field) => field[1].unique).map((field) => getFieldName({ model, field: field[0] }))];
 }
 
 function hasUniqueFields(entry: [string, string[]]): boolean {

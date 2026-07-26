@@ -85,6 +85,14 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(rawRow(uniquePk("user", "email"), valueSk("same@example.com", ""))).resolves.toMatchObject({ ownerSk: entitySk("u1") });
   });
 
+  it("enforces schema-derived uniqueness after Better Auth model and field remapping", async () => {
+    const adapter = dynamoDBAdapter({ tableName, client: docClient })({ secret: "test-secret", emailAndPassword: { enabled: true }, user: { modelName: "app_user", fields: { email: "email_address" } } } as never) as TestAdapter;
+    await create(adapter, "user", { id: "u1", email: "same@example.com", name: "Ada" });
+
+    await expect(create(adapter, "user", { id: "u2", email: "same@example.com", name: "Grace" })).rejects.toBeInstanceOf(DynamoDBConflictError);
+    await expect(rawRow(uniquePk("app_user", "email_address"), valueSk("same@example.com", ""))).resolves.toMatchObject({ ownerSk: entitySk("u1") });
+  });
+
   it("replaces sidecars and unique locks on update", async () => {
     const adapter = adapterFor({ client: docClient, uniqueFields: { user: ["email"] } });
     await create(adapter, "user", { id: "u1", email: "old@example.com", name: "Ada", org: "old" });
