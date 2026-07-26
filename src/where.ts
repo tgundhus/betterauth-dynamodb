@@ -5,6 +5,8 @@ type WhereOperator = CleanedWhere["operator"];
 
 export function planQuery(where: CleanedWhere[] = [], allowScan = false): QueryPlan {
   assertSupportedOperators(where);
+  const keyedProblem = keyedAccessProblem(where);
+  if (keyedProblem) return scanOrThrow(where, allowScan, keyedProblem);
   const id = eqWhere(where, "id");
   if (id) return { kind: "byId", where };
   const unique = firstEquality(where);
@@ -19,11 +21,11 @@ export function matchesWhere(item: Record<string, unknown>, where: CleanedWhere[
 }
 
 export function firstEquality(where: CleanedWhere[] = []): CleanedWhere | undefined {
-  return where.find((w) => w.operator === "eq" && w.connector === "AND" && isScalar(w.value));
+  return where.find((w) => isKeyedEquality(w) && isScalar(w.value));
 }
 
 export function eqWhere(where: CleanedWhere[], field: string): CleanedWhere | undefined {
-  return where.find((w) => w.field === field && w.operator === "eq" && w.connector === "AND");
+  return where.find((w) => w.field === field && isKeyedEquality(w));
 }
 
 export function compareValues(left: unknown, operator: CleanedWhere["operator"], right: CleanedWhere["value"], insensitive: boolean): boolean {
@@ -60,9 +62,37 @@ function evalClause(item: Record<string, unknown>, clause: CleanedWhere): boolea
   return compareValues(item[clause.field], clause.operator, clause.value, clause.mode === "insensitive");
 }
 
-function combine(acc: boolean, value: boolean, connector: "AND" | "OR", index: number): boolean {
+function combine(acc: boolean, value: boolean, connector: "AND" | "OR" | undefined, index: number): boolean {
   if (index === 0) return value;
   return connector === "OR" ? acc || value : acc && value;
+}
+
+function keyedAccessProblem(where: CleanedWhere[]): string | undefined {
+  if (hasOrPredicate(where)) return "OR predicates cannot use DynamoDB keyed access without risking incomplete results. Pass unsafeAllowScan: true to evaluate OR predicates with an explicit bounded scan.";
+  if (hasSafeKeyedEquality(where)) return undefined;
+  if (hasInsensitiveEquality(where)) return "Case-insensitive equality cannot use DynamoDB keyed access because id and scalar sidecar keys are case-sensitive. Pass unsafeAllowScan: true to evaluate it with an explicit bounded scan.";
+  return undefined;
+}
+
+function scanOrThrow(where: CleanedWhere[], allowScan: boolean, message: string): QueryPlan {
+  if (allowScan) return { kind: "byModel", where };
+  throw new UnsupportedQueryError(message);
+}
+
+function hasOrPredicate(where: CleanedWhere[]): boolean {
+  return where.length > 1 && where.some((clause) => clause.connector === "OR");
+}
+
+function hasSafeKeyedEquality(where: CleanedWhere[]): boolean {
+  return where.some((clause) => isKeyedEquality(clause) && isScalar(clause.value));
+}
+
+function hasInsensitiveEquality(where: CleanedWhere[]): boolean {
+  return where.some((clause) => clause.operator === "eq" && clause.mode === "insensitive");
+}
+
+function isKeyedEquality(clause: CleanedWhere): boolean {
+  return clause.operator === "eq" && clause.mode !== "insensitive";
 }
 
 function normalize(value: unknown, insensitive: boolean): any {

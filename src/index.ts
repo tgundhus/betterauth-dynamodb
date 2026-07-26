@@ -23,13 +23,13 @@ export function dynamoDBAdapter(adapterOptions: BetterAuthDynamoDBOptions) {
       const store = new DynamoDBStore({ ...adapterOptions, uniqueFields: mergeUniqueFields(schemaUniqueFields, adapterOptions.uniqueFields) });
       const adapter: any = {
         create: <T extends Record<string, unknown>>(data: { model: string; data: T }) => store.create(data.model, data.data),
-        findOne: <T>(data: { model: string; where: any[]; join?: Record<string, unknown> }) => {
+        findOne: <T>(data: { model: string; where: any[]; select?: string[]; join?: Record<string, unknown> }) => {
           assertNoNativeJoin(data.join);
-          return store.findOne<T>(data.model, data.where);
+          return store.findOne<T>(data.model, data.where, storageSelect(data.model, data.select, schema, getModelName, getFieldName));
         },
-        findMany: <T>(data: { model: string; where?: any[]; limit: number; offset?: number; sortBy?: { field: string; direction: "asc" | "desc" }; join?: Record<string, unknown> }) => {
+        findMany: <T>(data: { model: string; where?: any[]; limit: number; offset?: number; sortBy?: { field: string; direction: "asc" | "desc" }; select?: string[]; join?: Record<string, unknown> }) => {
           assertNoNativeJoin(data.join);
-          return store.findMany<T>(data.model, data.where, data.limit, data.offset, data.sortBy);
+          return store.findMany<T>(data.model, data.where, data.limit, data.offset, data.sortBy, storageSelect(data.model, data.select, schema, getModelName, getFieldName));
         },
         count: (data: { model: string; where?: any[] }) => store.count(data.model, data.where),
         update: <T>(data: { model: string; where: any[]; update: Record<string, unknown> }) => store.update<T>(data.model, data.where, data.update),
@@ -39,7 +39,6 @@ export function dynamoDBAdapter(adapterOptions: BetterAuthDynamoDBOptions) {
         consumeOne: <T>(data: { model: string; where: any[] }) => store.consumeOne<T>(data.model, data.where),
         incrementOne: <T>(data: { model: string; where: any[]; increment: Record<string, number>; set?: Record<string, unknown> }) =>
           store.incrementOne<T>(data.model, data.where, data.increment, data.set),
-        transaction: <R>(callback: (trx: any) => Promise<R>) => callback(adapter),
         options: { tableName: adapterOptions.tableName }
       };
       return adapter;
@@ -74,6 +73,16 @@ function uniqueFieldEntry(entry: [string, AdapterSchema[string]], getModelName: 
 
 function hasUniqueFields(entry: [string, string[]]): boolean {
   return entry[1].length > 0;
+}
+
+function storageSelect(model: string, select: string[] | undefined, schema: AdapterSchema, getModelName: ModelNameResolver, getFieldName: FieldNameResolver): string[] | undefined {
+  if (!select) return undefined;
+  const defaultModel = defaultModelName(model, schema, getModelName);
+  return select.map((field) => getFieldName({ model: defaultModel, field }));
+}
+
+function defaultModelName(model: string, schema: AdapterSchema, getModelName: ModelNameResolver): string {
+  return Object.keys(schema).find((key) => getModelName(key) === model) ?? model;
 }
 
 function assertNoNativeJoin(join: Record<string, unknown> | undefined): void {

@@ -49,7 +49,7 @@ export interface CleanedWhere {
   field: string;
   value: string | number | boolean | string[] | number[] | Date | null;
   operator: "eq" | "ne" | "lt" | "lte" | "gt" | "gte" | "in" | "not_in" | "contains" | "starts_with" | "ends_with";
-  connector: "AND" | "OR";
+  connector?: "AND" | "OR";
   mode: "sensitive" | "insensitive";
 }
 

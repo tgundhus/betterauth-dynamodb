@@ -106,6 +106,15 @@ describe("DynamoDBStore", () => {
     expect(command.input.ConsistentRead).toBe(true);
   });
 
+  it("projects selected fields after DynamoDB-backed findMany", async () => {
+    const row = { pk: modelPk("user"), sk: entitySk("u1"), id: "u1", email: "a@example.com", name: "Ada", entity: { id: "u1", email: "a@example.com", name: "Ada" }, ...rev };
+    const doc = client();
+    doc.send.mockImplementation(async (command) => (command instanceof ScanCommand ? { Items: [row] } : {}));
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, unsafeAllowScan: true });
+
+    await expect(store.findMany("user", [], 10, 0, undefined, ["id", "email"])).resolves.toEqual([{ id: "u1", email: "a@example.com" }]);
+  });
+
   it("preserves typed scalar equality in sidecar keys for plugin-like fields", async () => {
     const doc = client();
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
@@ -127,6 +136,44 @@ describe("DynamoDBStore", () => {
   it("rejects scan-shaped queries unless explicitly enabled", async () => {
     const store = new DynamoDBStore({ tableName: "auth", client: client() as never });
     await expect(store.findMany("user", [{ ...eq("email", "a"), operator: "contains" }], 10)).rejects.toBeInstanceOf(UnsupportedQueryError);
+  });
+
+  it("rejects OR predicates without unsafe scans even when one branch has equality", async () => {
+    const store = new DynamoDBStore({ tableName: "auth", client: client() as never });
+    await expect(store.findMany("user", [eq("email", "a@example.com"), { ...eq("role", "admin"), connector: "OR" }], 10)).rejects.toThrow(/OR predicates cannot use DynamoDB keyed access/);
+  });
+
+  it("uses an explicit scan for OR predicates and filters the full expression", async () => {
+    const rows = [
+      { pk: modelPk("user"), sk: entitySk("u1"), id: "u1", email: "a@example.com", role: "member", entity: { id: "u1", email: "a@example.com", role: "member" }, ...rev },
+      { pk: modelPk("user"), sk: entitySk("u2"), id: "u2", email: "b@example.com", role: "admin", entity: { id: "u2", email: "b@example.com", role: "admin" }, ...rev },
+      { pk: modelPk("user"), sk: entitySk("u3"), id: "u3", email: "c@example.com", role: "member", entity: { id: "u3", email: "c@example.com", role: "member" }, ...rev }
+    ];
+    const doc = client();
+    doc.send.mockImplementation(async (command) => (command instanceof ScanCommand ? { Items: rows } : {}));
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, unsafeAllowScan: true });
+    await expect(store.findMany("user", [eq("email", "a@example.com"), { ...eq("role", "admin"), connector: "OR" }], 10)).resolves.toEqual([rows[0]?.entity, rows[1]?.entity]);
+    expect(doc.send.mock.calls[0]?.[0]).toBeInstanceOf(ScanCommand);
+  });
+
+  it("rejects case-insensitive id and scalar equality without unsafe scans", async () => {
+    const store = new DynamoDBStore({ tableName: "auth", client: client() as never });
+    await expect(store.findOne("user", [{ ...eq("id", "U1"), mode: "insensitive" }])).rejects.toThrow(/Case-insensitive equality cannot use DynamoDB keyed access/);
+    await expect(store.findMany("user", [{ ...eq("email", "A@EXAMPLE.COM"), mode: "insensitive" }], 10)).rejects.toThrow(/Case-insensitive equality cannot use DynamoDB keyed access/);
+  });
+
+  it("uses an explicit scan for case-insensitive id and scalar equality", async () => {
+    const rows = [
+      { pk: modelPk("user"), sk: entitySk("u1"), id: "u1", email: "Hello@Test.com", entity: { id: "u1", email: "Hello@Test.com" }, ...rev },
+      { pk: modelPk("user"), sk: entitySk("u2"), id: "u2", email: "other@test.com", entity: { id: "u2", email: "other@test.com" }, ...rev }
+    ];
+    const doc = client();
+    doc.send.mockImplementation(async (command) => (command instanceof ScanCommand ? { Items: rows } : {}));
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, unsafeAllowScan: true });
+    await expect(store.findMany("user", [{ ...eq("email", "hello@test.com"), mode: "insensitive" }], 10)).resolves.toEqual([rows[0]?.entity]);
+    await expect(store.findOne("user", [{ ...eq("id", "U1"), mode: "insensitive" }])).resolves.toEqual(rows[0]?.entity);
+    expect(doc.send.mock.calls[0]?.[0]).toBeInstanceOf(ScanCommand);
+    expect(doc.send.mock.calls[1]?.[0]).toBeInstanceOf(ScanCommand);
   });
 
   it("builds conditional atomic consumeOne", async () => {
@@ -399,7 +446,7 @@ describe("DynamoDBStore", () => {
     await expect(store.create("user", { id: "x".repeat(3000) })).rejects.toThrow(/1024-byte sort key limit/);
   });
 
-  it("supports delete, transaction callback, sorted windows, and transactional create command construction", async () => {
+  it("supports delete, sorted windows, and transactional create command construction", async () => {
     const rows = [
       { pk: modelPk("user"), sk: entitySk("u1"), id: "u1", email: "b", entity: { id: "u1", email: "b" }, ...rev },
       { pk: modelPk("user"), sk: entitySk("u2"), id: "u2", email: "a", entity: { id: "u2", email: "a" }, ...rev }
@@ -412,7 +459,6 @@ describe("DynamoDBStore", () => {
     });
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never, unsafeAllowScan: true });
     await expect(store.findMany("user", [], 1, 0, { field: "email", direction: "asc" })).resolves.toEqual([{ id: "u2", email: "a" }]);
-    await expect(store.transaction(async () => "ok")).resolves.toBe("ok");
     await store.delete("user", [eq("id", "u1")]);
     await store.transactCreate([{ model: "user", data: { id: "u3" } }]);
     expect(doc.send.mock.calls.some((call) => call[0] instanceof TransactWriteCommand)).toBe(true);

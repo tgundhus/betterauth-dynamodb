@@ -3,12 +3,40 @@ import { UnsupportedQueryError } from "../src/errors.js";
 import type { CleanedWhere } from "../src/types.js";
 import { matchesWhere, planQuery } from "../src/where.js";
 
-const clause = (field: string, operator: CleanedWhere["operator"], value: CleanedWhere["value"]): CleanedWhere => ({ field, operator, value, connector: "AND", mode: "sensitive" });
+const clause = (field: string, operator: CleanedWhere["operator"], value: CleanedWhere["value"], overrides: Partial<CleanedWhere> = {}): CleanedWhere => ({ field, operator, value, connector: "AND", mode: "sensitive", ...overrides });
 
 describe("where planning and matching", () => {
   it("plans id and scalar equality efficiently", () => {
     expect(planQuery([clause("id", "eq", "1")]).kind).toBe("byId");
     expect(planQuery([clause("email", "eq", "a")]).kind).toBe("byFieldValue");
+  });
+
+  it("rejects OR predicates instead of narrowing to one keyed branch", () => {
+    const where = [clause("email", "eq", "a@example.com"), clause("role", "eq", "admin", { connector: "OR" })];
+    expect(() => planQuery(where)).toThrow(UnsupportedQueryError);
+    expect(() => planQuery(where)).toThrow(/OR predicates cannot use DynamoDB keyed access/);
+    expect(planQuery(where, true).kind).toBe("byModel");
+  });
+
+  it("still uses keyed access for a single clause whose connector is OR", () => {
+    expect(planQuery([clause("email", "eq", "a@example.com", { connector: "OR" })]).kind).toBe("byFieldValue");
+  });
+
+  it("treats an undefined connector as AND for keyed planning", () => {
+    const where: CleanedWhere[] = [{ field: "email", operator: "eq", value: "a@example.com", mode: "sensitive" }];
+    expect(planQuery(where).kind).toBe("byFieldValue");
+  });
+
+  it("rejects case-insensitive equality as the only keyed access path", () => {
+    const where = [clause("id", "eq", "U1", { mode: "insensitive" })];
+    expect(() => planQuery(where)).toThrow(UnsupportedQueryError);
+    expect(() => planQuery(where)).toThrow(/Case-insensitive equality cannot use DynamoDB keyed access/);
+    expect(planQuery(where, true).kind).toBe("byModel");
+  });
+
+  it("can use another safe keyed equality beside an insensitive predicate", () => {
+    const where = [clause("email", "eq", "a@example.com", { mode: "insensitive" }), clause("role", "eq", "admin")];
+    expect(planQuery(where).kind).toBe("byFieldValue");
   });
 
   it("evaluates comparison, string, and set operators", () => {

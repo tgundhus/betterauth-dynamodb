@@ -31,15 +31,15 @@ export class DynamoDBStore {
     return fromStoredItem<T>(item, this.options.ttl) as T;
   }
 
-  async findOne<T>(model: string, where: CleanedWhere[]): Promise<T | null> {
-    const rows = await this.findMany<T>(model, where, 1);
+  async findOne<T>(model: string, where: CleanedWhere[], select?: string[]): Promise<T | null> {
+    const rows = await this.findMany<T>(model, where, 1, 0, undefined, select);
     return rows[0] ?? null;
   }
 
-  async findMany<T>(model: string, where: CleanedWhere[] = [], limit = 100, offset = 0, sortBy?: { field: string; direction: "asc" | "desc" }): Promise<T[]> {
+  async findMany<T>(model: string, where: CleanedWhere[] = [], limit = 100, offset = 0, sortBy?: { field: string; direction: "asc" | "desc" }, select?: string[]): Promise<T[]> {
     const plan = planQuery(where, this.options.unsafeAllowScan);
     const rows = await this.loadRows(model, plan);
-    return selectWindow(rows.filter((row) => matchesWhere(row, where)), limit, offset, sortBy, this.options.ttl) as T[];
+    return selectWindow(rows.filter((row) => matchesWhere(row, where)), limit, offset, sortBy, this.options.ttl, select) as T[];
   }
 
   async count(model: string, where: CleanedWhere[] = []): Promise<number> {
@@ -109,10 +109,6 @@ export class DynamoDBStore {
     } catch (error) {
       return handleIncrementError(error);
     }
-  }
-
-  async transaction<R>(callback: (store: DynamoDBStore) => Promise<R>): Promise<R> {
-    return callback(this);
   }
 
   private async targetByWhere(model: string, where: CleanedWhere[]): Promise<StoredItem | null> {
@@ -235,9 +231,14 @@ function keyOf(item: Pick<StoredItem, "pk" | "sk">): { pk: string; sk: string } 
   return { pk: item.pk, sk: item.sk };
 }
 
-function selectWindow(rows: StoredItem[], limit: number, offset: number, sortBy?: { field: string; direction: "asc" | "desc" }, ttl?: false | TtlOptions): Record<string, unknown>[] {
+function selectWindow(rows: StoredItem[], limit: number, offset: number, sortBy?: { field: string; direction: "asc" | "desc" }, ttl?: false | TtlOptions, select?: string[]): Record<string, unknown>[] {
   const sorted = sortBy ? [...rows].sort((a, b) => compareSort(a, b, sortBy)) : rows;
-  return sorted.slice(offset, offset + limit).map((row) => fromStoredItem<Record<string, unknown>>(row, ttl) ?? {});
+  return sorted.slice(offset, offset + limit).map((row) => projectRecord(fromStoredItem<Record<string, unknown>>(row, ttl) ?? {}, select));
+}
+
+function projectRecord(row: Record<string, unknown>, select?: string[]): Record<string, unknown> {
+  if (!select) return row;
+  return Object.fromEntries(select.map((field) => [field, row[field]]));
 }
 
 function compareSort(a: StoredItem, b: StoredItem, sortBy: { field: string; direction: "asc" | "desc" }): number {

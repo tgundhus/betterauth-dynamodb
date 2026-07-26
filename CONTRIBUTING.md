@@ -12,7 +12,7 @@ bun run test:integration:local
 
 `bun run verify` runs typecheck, ESLint, coverage tests, the CRAP quality gate, and build. Run it before opening a PR or handing off work. For storage, transaction, pagination, TTL, client-construction, or key/index behavior changes, also run `bun run test:integration:local`.
 
-The local integration suite requires Docker. It uses Testcontainers with AWS's official `amazon/dynamodb-local:2.6.1` image, in-memory/shared DB mode, disabled telemetry, a random mapped port, fake credentials, and one fresh table per test. CI runs it as a separate Docker-capable job and must fail if the container or tests fail.
+The local integration suite requires Docker. It uses Testcontainers with AWS's official `amazon/dynamodb-local:2.6.1` image, in-memory/shared DB mode, disabled telemetry, a random mapped port, fake credentials, isolated local tables, and Better Auth's official adapter conformance suites. CI runs it as a separate Docker-capable job and must fail if the container or tests fail.
 
 Useful focused commands:
 

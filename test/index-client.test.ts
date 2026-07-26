@@ -36,7 +36,6 @@ describe("public adapter and client helpers", () => {
     await adapter.delete({ model: "user", where: [{ field: "id", value: "u" }] });
     await adapter.deleteMany({ model: "user", where: [{ field: "email", value: "a@example.com" }] });
     await adapter.consumeOne({ model: "user", where: [{ field: "id", value: "u" }] });
-    await adapter.transaction(async () => "ok");
   });
 
   it.each([
@@ -70,6 +69,19 @@ describe("public adapter and client helpers", () => {
     const command = send.mock.calls[0]?.[0] as TransactWriteCommand;
     expect(command.input.TransactItems).toContainEqual(expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ pk: uniquePk("app_user", "handle"), sk: valueSk("ada", "") }) }) }));
     expect(command.input.TransactItems).not.toContainEqual(expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ pk: uniquePk("user", "username") }) }) }));
+  });
+
+  it("projects selected fields using transformed storage names", async () => {
+    const send = vi.fn(async (command: { constructor: { name: string } }) => {
+      if (command.constructor.name === "ScanCommand") return { Items: [{ pk: "MODEL#s8:app_user", sk: "ID#s2:u1", id: "u1", email_address: "a@example.com", name: "Ada", [REVISION_ATTRIBUTE]: "rev-1", entity: { id: "u1", email_address: "a@example.com", name: "Ada" } }] };
+      return {};
+    });
+    const adapter = dynamoDBAdapter({ tableName: "auth", client: { send } as never, unsafeAllowScan: true })({ secret: "x", user: { modelName: "app_user", fields: { email: "email_address" } } } as never);
+
+    const [result] = (await adapter.findMany({ model: "user", select: ["id", "email"], limit: 1 })) as Record<string, unknown>[];
+
+    expect(result).toMatchObject({ id: "u1", email: "a@example.com" });
+    expect(result?.name).toBeUndefined();
   });
 
   it("rejects duplicate creates through mapped schema unique locks", async () => {
