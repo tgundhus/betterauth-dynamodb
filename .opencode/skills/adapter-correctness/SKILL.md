@@ -23,4 +23,4 @@ Use this skill for implementation changes under `src/` or behavior-focused tests
 
 ## Documentation prompts
 
-Update `README.md` when the change affects options, table provisioning, storage layout, concurrency guarantees, limitations, or generic SST/Lambda/serverless usage. Update `AGENTS.md` if an invariant changes.
+Update `README.md` when the change affects options, table provisioning, storage layout, concurrency guarantees, limitations, or generic deployment usage. Update `AGENTS.md` if an invariant changes.
