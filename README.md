@@ -4,19 +4,21 @@ Production-oriented DynamoDB adapter targeting Better Auth `^1.6.25` via the off
 
 ## Status
 
-This package is not currently published to npm; consume it from source/git or a local workspace/path until it is published. The repository has unit coverage for command construction, adapter semantics, query planning, and Better Auth factory wiring, plus an explicit Docker-backed DynamoDB Local integration suite that includes Better Auth's official adapter conformance suites.
+This package is prepared for public npm publication as `@bjorntech/betterauth-dynamodb`. The repository has unit coverage for command construction, adapter semantics, query planning, and Better Auth factory wiring, plus an explicit Docker-backed DynamoDB Local integration suite that includes Better Auth's official adapter conformance suites.
 
 Storage compatibility note: the current storage format uses transactionally maintained scalar equality sidecar rows in the base table, delimiter-safe length-prefixed key components, SHA-256 hashes for sidecar/unique-lock values, and hidden internal revision metadata for ABA-safe mutations. Experimental tables using older generic `gsi1`/`idx_<field>_*`, pre-length-prefixed, pre-hash, or pre-revision formats should be recreated or migrated before using this version; pre-revision rows can still be read but fail clearly if mutated.
 
 ## Installation
 
-Use the package manager workflow for a local path/workspace dependency, for example from a consuming app:
+Install the adapter and its Better Auth peer dependency with your package manager:
 
 ```sh
-bun add ../betterauth-dynamodb
+npm install @bjorntech/betterauth-dynamodb better-auth
+bun add @bjorntech/betterauth-dynamodb better-auth
+pnpm add @bjorntech/betterauth-dynamodb better-auth
 ```
 
-`better-auth` is a peer dependency. AWS SDK DynamoDB packages are runtime dependencies of this adapter.
+AWS SDK DynamoDB packages are runtime dependencies of this adapter.
 
 ## Basic usage
 

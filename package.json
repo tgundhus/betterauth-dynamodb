@@ -1,7 +1,13 @@
 {
   "name": "@bjorntech/betterauth-dynamodb",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Production-oriented Better Auth DynamoDB adapter",
+  "keywords": [
+    "better-auth",
+    "dynamodb",
+    "adapter",
+    "aws"
+  ],
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
@@ -15,7 +21,7 @@
     "url": "https://github.com/bjorntech/betterauth-dynamodb/issues"
   },
   "publishConfig": {
-    "access": "restricted"
+    "access": "public"
   },
   "exports": {
     ".": {
@@ -26,6 +32,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
