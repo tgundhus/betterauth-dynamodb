@@ -122,7 +122,7 @@ describe("DynamoDB Local adapter integration", () => {
     const adapter = adapterFor({ client: docClient, uniqueFields: { verification: ["token"] } });
     await create(adapter, "verification", { id: "v1", token: "tok", identifier: "email" });
     const barrier = new ReadBarrier(2);
-    const concurrentAdapter = adapterFor({ client: clientWithReadBarrier(barrier, modelPk("verification"), entitySk("v1")) });
+    const concurrentAdapter = adapterFor({ client: clientWithReadBarrier(barrier, modelPk("verification"), entitySk("v1")), uniqueFields: { verification: ["token"] } });
 
     const results = await Promise.all([
       concurrentAdapter.consumeOne({ model: "verification", where: [eq("id", "v1"), eq("token", "tok")] }),
