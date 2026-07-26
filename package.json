@@ -1,6 +1,6 @@
 {
   "name": "@bjorntech/betterauth-dynamodb",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Production-oriented Better Auth DynamoDB adapter",
   "keywords": [
     "better-auth",
@@ -17,6 +17,7 @@
     "url": "git+https://github.com/bjorntech/betterauth-dynamodb.git"
   },
   "homepage": "https://github.com/bjorntech/betterauth-dynamodb#readme",
+  "readmeFilename": "README.md",
   "bugs": {
     "url": "https://github.com/bjorntech/betterauth-dynamodb/issues"
   },

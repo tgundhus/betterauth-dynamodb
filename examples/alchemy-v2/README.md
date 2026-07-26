@@ -28,7 +28,7 @@ bun install
 cp .env.example .env
 ```
 
-Edit `.env` with a long random `BETTER_AUTH_SECRET`. The local dependency is `@bjorntech/betterauth-dynamodb: file:../..`; replace it with the published package version after publication/access is available in your environment.
+Edit `.env` with a long random `BETTER_AUTH_SECRET`. The local dependency is `@bjorntech/betterauth-dynamodb: file:../..`; for deployments, replace it with the published package version you intend to deploy.
 
 Configure Alchemy's AWS credentials/profile according to the Alchemy AWS setup guide before deploying.
 
