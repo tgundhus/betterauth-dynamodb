@@ -24,10 +24,10 @@ Treat this repository as a future public open-source package. Do not rely on sib
 
 - **Atomic correctness matters.** Preserve conditional writes/deletes/updates for create uniqueness, `consumeOne`, and `incrementOne`. Do not weaken race handling for verification tokens, rate limits, or unique records.
 - **No hidden scans.** Queries that cannot use id equality or scalar field equality must throw unless `unsafeAllowScan: true` is explicitly configured. Do not add fallback scans, paginated table walks, or count/update/delete-many scans behind a friendly API.
-- **Injected client compatibility.** Keep `client?: DynamoDBDocumentClient` as the preferred production path so SST/Lambda/serverless apps own AWS region, credentials, middleware, tracing, and marshalling options.
+- **Injected client compatibility.** Keep `client?: DynamoDBDocumentClient` as the preferred production path so deploying applications own AWS region, credentials, middleware, tracing, and marshalling options.
 - **Stable key/index contract.** Changes to entity `pk`/`sk`, scalar sidecar keys, unique lock keys, hidden revision metadata, TTL defaults, or native index requirements are storage-format changes and require migration notes plus compatibility consideration.
 - **Better Auth compatibility.** Use the official adapter factory API. Avoid assumptions about private Better Auth internals unless covered by tests and documented as version-specific.
-- **No sibling-repo coupling.** Examples may mention generic SST/Lambda/serverless integration, but package code must not import or depend on local sibling repositories.
+- **No sibling-repo coupling.** Examples must stay standalone and generic, and package code must not import or depend on local sibling repositories.
 - **No secrets.** Never commit credentials, real table names from private infrastructure, `.env` files, AWS account IDs, tokens, or copied production data.
 
 ## Coding conventions

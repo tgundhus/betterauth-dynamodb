@@ -1,0 +1,24 @@
+{
+  "name": "betterauth-dynamodb-example-alchemy-v2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "deploy": "alchemy deploy",
+    "destroy": "alchemy destroy"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.758.0",
+    "@aws-sdk/lib-dynamodb": "^3.758.0",
+    "@bjorntech/betterauth-dynamodb": "file:../..",
+    "@types/aws-lambda": "^8.10.152",
+    "alchemy": "2.0.0-beta.64",
+    "better-auth": "1.6.25",
+    "effect": "4.0.0-beta.101"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.8.3"
+  },
+  "packageManager": "bun@1.2.5"
+}

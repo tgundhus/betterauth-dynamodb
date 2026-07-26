@@ -13,7 +13,7 @@ Use this skill for docs, package metadata, and publication-readiness work. Do no
 2. Keep installation wording honest until the package is actually published. Prefer local/path or future-publication wording over implying npm availability.
 3. Remove or avoid nonexistent repository URLs, package URLs, security contacts, maintainers, or governance claims.
 4. State licensing status accurately. Add a `LICENSE` only after the project owner has selected a license.
-5. Confirm public examples contain no secrets, private AWS account details, project-specific identifiers, sibling paths, or sibling-repo dependencies. Generic examples may show `Resource.*` and SST patterns, but package code must remain standalone.
+5. Confirm public examples contain no secrets, private AWS account details, project-specific identifiers, sibling paths, or sibling-repo dependencies. Package code must remain standalone.
 6. Keep quality policy visible: `bun run verify`, coverage thresholds, and per-production-function CRAP <= 6.
 7. Run `bun run verify` after docs/config changes when feasible, because docs must not undermine existing guarantees.
 

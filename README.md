@@ -53,7 +53,9 @@ export const auth = betterAuth({
 
 When the `verification` model uses adapter-managed TTL, disable Better Auth's verification cleanup as shown above. Otherwise Better Auth can issue a range-only `deleteMany` such as `expiresAt < now`, which this adapter rejects by default because it would require a hidden table/model scan.
 
-For local development you may pass `region`, `endpoint`, and/or `dynamoDBClientConfig` instead of `client`. Production serverless apps should usually inject the client.
+For local development you may pass `region`, `endpoint`, and/or `dynamoDBClientConfig` instead of `client`. Production deployments should usually inject the client.
+
+See [examples](./examples/) for standalone deployment examples that use local path dependencies while this package is unpublished.
 
 ## API
 
@@ -74,48 +76,13 @@ import { dynamoDBAdapter } from "@bjorntech/betterauth-dynamodb";
 
 The package also exports `BetterAuthDynamoDBOptions`, `TtlOptions`, `DynamoDBAdapterError`, and `UnsupportedQueryError`.
 
-## SST / Lambda integration
+## Deployment notes
 
-For SST v4 Lambda apps that use `Resource.*` links, keep table ownership in the app and inject a document client into the adapter:
-
-```ts
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
-import { betterAuth } from "better-auth";
-import { dynamoDBAdapter } from "@bjorntech/betterauth-dynamodb";
-import { Resource } from "sst";
-
-const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
-  marshallOptions: { removeUndefinedValues: true }
-});
-
-export const auth = betterAuth({
-  database: dynamoDBAdapter({
-    tableName: Resource.BetterAuthTable.name,
-    client: dynamo,
-    ttl: { fields: { session: "expiresAt", verification: "expiresAt" } }
-  }),
-  verification: { disableCleanup: true },
-  emailAndPassword: { enabled: true }
-});
-```
+Keep table ownership in your application infrastructure and inject a `DynamoDBDocumentClient` into the adapter. Provision a DynamoDB table with `pk` as the partition key, `sk` as the sort key, and DynamoDB TTL enabled on the adapter TTL attribute when you configure adapter-managed TTL. No GSIs are required for the current sidecar-index design.
 
 For email OTP sign-in or other flows where verification rows expire through DynamoDB TTL, keep `verification.disableCleanup: true` in the Better Auth config. Without it, Better Auth attempts to clean verification rows with a range-only `deleteMany(expiresAt < now)`, and the adapter rejects that no-key access pattern under its no-hidden-scan policy.
 
-Better Auth database-backed rate limiting has the same DynamoDB trade-off. The rate-limit `key` field is schema-unique and works well for exact-key increments, but Better Auth cleanup can require range-only predicates such as old `lastRequest` values. Leave `unsafeAllowScan` disabled for serverless production unless you have a tightly bounded table and have accepted the cost/consistency profile. Prefer Better Auth's non-database/in-memory limiter for single-instance local development, an edge/API-gateway/WAF limiter, or an application-owned DynamoDB rate-limit table with access patterns designed for your cleanup needs.
-
-Provision and link a DynamoDB table from your SST config. No GSIs are required for the current sidecar-index design:
-
-```ts
-const betterAuthTable = new sst.aws.Dynamo("BetterAuthTable", {
-  fields: {
-    pk: "string",
-    sk: "string"
-  },
-  primaryIndex: { hashKey: "pk", rangeKey: "sk" },
-  ttl: "ttl"
-});
-```
+Better Auth database-backed rate limiting has the same DynamoDB trade-off. The rate-limit `key` field is schema-unique and works well for exact-key increments, but Better Auth cleanup can require range-only predicates such as old `lastRequest` values. Leave `unsafeAllowScan` disabled for production unless you have a tightly bounded table and have accepted the cost/consistency profile. Prefer Better Auth's non-database/in-memory limiter for single-instance local development, an edge/API-gateway/WAF limiter, or an application-owned DynamoDB rate-limit table with access patterns designed for your cleanup needs.
 
 If a needed access pattern has no id or scalar equality predicate, the adapter throws unless `unsafeAllowScan: true` is set. A future optional native-GSI optimization may be added with descriptive API names, but there is no generic GSI option today.
 
