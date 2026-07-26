@@ -1,24 +1,16 @@
 # @bjorntech/betterauth-dynamodb
 
-Production-oriented DynamoDB adapter targeting Better Auth `^1.6.23`, implemented with Better Auth's official `createAdapterFactory` API and developed/tested against Better Auth 1.6.25 adapter factory behavior.
+Production-oriented DynamoDB adapter targeting Better Auth `^1.6.25` via the official `createAdapterFactory` API.
 
 ## Status
 
-This repository is an initial package implementation prepared for restricted/private npm publication as `@bjorntech/betterauth-dynamodb@0.1.0`. It has unit coverage for command construction, adapter semantics, query planning, and Better Auth factory wiring, plus an explicit Docker-backed DynamoDB Local integration suite that includes Better Auth's official adapter conformance suites.
+This package is not currently published to npm; consume it from source/git or a local workspace/path until it is published. The repository has unit coverage for command construction, adapter semantics, query planning, and Better Auth factory wiring, plus an explicit Docker-backed DynamoDB Local integration suite that includes Better Auth's official adapter conformance suites.
 
-Pre-release storage note: in November 2025 the adapter design was corrected to remove the misleading generic `gsi1`/`idx_<field>_*` model. Scalar equality lookups now use transactionally maintained sidecar rows in the base table. In July 2026 key components changed to delimiter-safe length-prefixed strings, sidecar/unique-lock values use SHA-256 hashes, and entity rows gained hidden internal revision metadata for ABA-safe mutations. Existing experimental tables created with older formats should be recreated or migrated before using this version; pre-revision rows can still be read but fail clearly if mutated.
-
-The package may not be published to a registry yet. Until restricted npm publication and your access are confirmed by the project owner, install it from this repository or a local workspace/path rather than assuming npm availability.
+Storage compatibility note: the current storage format uses transactionally maintained scalar equality sidecar rows in the base table, delimiter-safe length-prefixed key components, SHA-256 hashes for sidecar/unique-lock values, and hidden internal revision metadata for ABA-safe mutations. Experimental tables using older generic `gsi1`/`idx_<field>_*`, pre-length-prefixed, pre-hash, or pre-revision formats should be recreated or migrated before using this version; pre-revision rows can still be read but fail clearly if mutated.
 
 ## Installation
 
-If published in your environment and your npm account has access to the private/restricted package:
-
-```sh
-bun add @bjorntech/betterauth-dynamodb better-auth @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb
-```
-
-For local development before publication, use the package manager workflow for a local path/workspace dependency, for example from a consuming app:
+Use the package manager workflow for a local path/workspace dependency, for example from a consuming app:
 
 ```sh
 bun add ../betterauth-dynamodb
@@ -55,7 +47,7 @@ When the `verification` model uses adapter-managed TTL, disable Better Auth's ve
 
 For local development you may pass `region`, `endpoint`, and/or `dynamoDBClientConfig` instead of `client`. Production deployments should usually inject the client.
 
-See [examples](./examples/) for standalone deployment examples that use local path dependencies while this package is unpublished.
+See [examples](./examples/) for standalone deployment examples that use local path dependencies.
 
 ## API
 
@@ -120,7 +112,7 @@ bun run verify
 bun run test:integration:local
 ```
 
-`bun run verify` runs typecheck, ESLint, coverage tests, CRAP check, and build. It intentionally excludes Docker integration tests so the unit/CRAP gate stays fast and deterministic. `bun run test:integration:local` starts DynamoDB Local in Docker using a random mapped port, fake credentials, in-memory shared DB mode, telemetry disabled, and isolated tables for the local integration and official Better Auth adapter conformance suites.
+`bun run verify` runs typecheck, ESLint, coverage tests, CRAP check, and build. It intentionally excludes Docker integration tests so the unit/CRAP gate stays fast and deterministic. `bun run test:integration:local` starts DynamoDB Local in Docker using a random mapped port, fake credentials, in-memory shared DB mode, telemetry disabled, and isolated tables for the local integration and official Better Auth adapter conformance suites. These suites run against better-auth 1.6.25.
 
 Coverage thresholds are enforced for production `src` code (excluding pure types). CRAP is computed per production function as:
 
@@ -150,5 +142,3 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md). Contributions should preserve atomic c
 ## License
 
 MIT © 2026 BjornTech AB. See [LICENSE](./LICENSE).
-
-The MIT license describes the code license; it does not imply public npm package access.

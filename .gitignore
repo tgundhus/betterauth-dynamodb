@@ -2,3 +2,10 @@ node_modules/
 dist/
 coverage/
 .DS_Store
+.env
+.env.*
+!.env.example
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/bun.lock
