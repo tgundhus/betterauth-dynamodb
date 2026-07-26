@@ -4,7 +4,7 @@ Production-oriented DynamoDB adapter targeting Better Auth `^1.6.25` via the off
 
 ## Status
 
-This package is prepared for public npm publication as `@bjorntech/betterauth-dynamodb`. The repository has unit coverage for command construction, adapter semantics, query planning, and Better Auth factory wiring, plus an explicit Docker-backed DynamoDB Local integration suite that includes Better Auth's official adapter conformance suites.
+This package is published on npm as `@bjorntech/betterauth-dynamodb`. The repository has unit coverage for command construction, adapter semantics, query planning, and Better Auth factory wiring, plus an explicit Docker-backed DynamoDB Local integration suite that includes Better Auth's official adapter conformance suites.
 
 Storage compatibility note: the current storage format uses transactionally maintained scalar equality sidecar rows in the base table, delimiter-safe length-prefixed key components, SHA-256 hashes for sidecar/unique-lock values, and hidden internal revision metadata for ABA-safe mutations. Experimental tables using older generic `gsi1`/`idx_<field>_*`, pre-length-prefixed, pre-hash, or pre-revision formats should be recreated or migrated before using this version; pre-revision rows can still be read but fail clearly if mutated.
 

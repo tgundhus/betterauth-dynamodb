@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-07-26
+
+### Fixed
+
+- Adds explicit npm README filename metadata for the patch release after the `1.0.0` registry metadata rendered an empty README despite the packed tarball containing `README.md`.
+- Updates README status wording now that the package is publicly available on npm.
+
 ## [1.0.0] - 2026-07-26
 
 ### Added
@@ -17,4 +24,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Defines the 1.0 storage layout contract for entity rows, scalar equality sidecar rows, unique lock rows, delimiter-safe length-prefixed key components, hashed sidecar/lock values, and hidden revision metadata.
 - Includes unit coverage, DynamoDB Local integration tests, Better Auth official adapter conformance suites, coverage thresholds, and a per-production-function CRAP `<= 6` quality gate through `bun run verify`.
 
+[1.0.1]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/bjorntech/betterauth-dynamodb/releases/tag/v1.0.0

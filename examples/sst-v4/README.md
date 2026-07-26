@@ -34,7 +34,7 @@ Set the Better Auth secret before deploy or live dev:
 bun sst secret set BetterAuthSecret "replace-with-a-long-random-secret"
 ```
 
-The local dependency is `@bjorntech/betterauth-dynamodb: file:../..`. Replace it with the published package version after publication/access is available in your environment.
+The local dependency is `@bjorntech/betterauth-dynamodb: file:../..`. For deployments, replace it with the published package version you intend to deploy.
 
 ## Dev
 
