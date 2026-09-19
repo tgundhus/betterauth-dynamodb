@@ -81,6 +81,17 @@ describe("DynamoDBStore", () => {
     expect(command.input.TransactItems).toContainEqual(expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ pk: uniquePk("user", "email") }) }) }));
   });
 
+  it("guards sidecar and unique-lock deletion by the expected owner", async () => {
+    const row = { pk: modelPk("user"), sk: entitySk("u1"), id: "u1", model: "user", email: "old", entity: { id: "u1", email: "old" }, ...rev };
+    const doc = client([row]);
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, uniqueFields: { user: ["email"] } });
+    await store.delete("user", [eq("id", "u1")]);
+    const command = doc.send.mock.calls[1]?.[0] as TransactWriteCommand;
+    const deletes = command.input.TransactItems?.filter((item) => item.Delete).map((item) => item.Delete);
+    expect(deletes?.every((item) => item?.ConditionExpression).valueOf()).toBe(true);
+    expect(deletes?.find((item) => item?.ExpressionAttributeValues?.[":ownerPk"])?.ExpressionAttributeValues).toMatchObject({ ":ownerPk": modelPk("user"), ":ownerSk": entitySk("u1") });
+  });
+
   it("uses get for id equality lookups and returns Better Auth-visible entity only", async () => {
     const doc = client([{ pk: modelPk("user"), sk: entitySk("u1"), id: "u1", email: "a@example.com", entity: { id: "u1", email: "a@example.com", [REVISION_ATTRIBUTE]: "user-field" }, ...rev }]);
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
@@ -314,6 +325,155 @@ describe("DynamoDBStore", () => {
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never, pageSize: 1 });
     await expect(store.findMany("user", [eq("org", "o1")], 1, 0, { field: "email", direction: "asc" })).resolves.toEqual([{ id: "u2", org: "o1", email: "a" }]);
     expect((doc.send.mock.calls[0]?.[0] as QueryCommand).input.Limit).toBe(1);
+  });
+
+  it("deduplicates indexed IN candidates and applies residual filters before the global window", async () => {
+    const rows = [
+      { pk: modelPk("user"), sk: entitySk("u1"), id: "u1", email: "a", role: "admin", entity: { id: "u1", email: "a", role: "admin" }, ...rev },
+      { pk: modelPk("user"), sk: entitySk("u2"), id: "u2", email: "b", role: "user", entity: { id: "u2", email: "b", role: "user" }, ...rev }
+    ];
+    const sidecars = rows.map((row) => ({ pk: indexPk("user", "email", row.email), sk: indexSk(row.id), ownerPk: row.pk, ownerSk: row.sk, entity: {} }));
+    const doc = client();
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof QueryCommand) return { Items: sidecars.filter((item) => item.pk === command.input.ExpressionAttributeValues?.[":pk"]) };
+      if (command instanceof GetCommand) return { Item: rows.find((row) => row.sk === command.input.Key?.sk) };
+      return {};
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
+    const where = [{ field: "email", operator: "in", value: ["a", "a", "b"], mode: "sensitive", connector: "AND" }, { ...eq("role", "admin"), operator: "contains" }] as CleanedWhere[];
+    const result = await store.findMany("user", where, 1, 0, { field: "email", direction: "desc" });
+    expect(result).toEqual([{ id: "u1", email: "a", role: "admin" }]);
+    expect(doc.send.mock.calls.filter(([command]) => command instanceof QueryCommand)).toHaveLength(2);
+  });
+
+  it("uses the sensitive IN clause as the sidecar anchor when an insensitive IN comes first", async () => {
+    const owner = { pk: modelPk("user"), sk: entitySk("u1"), id: "u1", email: "a@example.com", role: "admin", entity: { id: "u1", email: "a@example.com", role: "admin" }, ...rev };
+    const sidecar = { pk: indexPk("user", "role", "admin"), sk: indexSk("u1"), ownerPk: owner.pk, ownerSk: owner.sk, entity: {} };
+    const doc = client();
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof QueryCommand) return { Items: command.input.ExpressionAttributeValues?.[":pk"] === indexPk("user", "role", "admin") ? [sidecar] : [] };
+      if (command instanceof GetCommand) return { Item: owner };
+      return {};
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
+    const where = [
+      { field: "email", operator: "in", value: ["A@EXAMPLE.COM"], mode: "insensitive", connector: "AND" },
+      { field: "role", operator: "in", value: ["admin"], mode: "sensitive", connector: "AND" }
+    ] as CleanedWhere[];
+
+    await expect(store.findMany("user", where, 10)).resolves.toEqual([owner.entity]);
+    expect((doc.send.mock.calls[0]?.[0] as QueryCommand).input.ExpressionAttributeValues?.[":pk"]).toBe(indexPk("user", "role", "admin"));
+  });
+
+  it("uses a sensitive equality anchor beside an insensitive equality residual", async () => {
+    const owner = { pk: modelPk("user"), sk: entitySk("u1"), id: "u1", email: "a@example.com", role: "admin", entity: { id: "u1", email: "a@example.com", role: "admin" }, ...rev };
+    const sidecar = { pk: indexPk("user", "role", "admin"), sk: indexSk("u1"), ownerPk: owner.pk, ownerSk: owner.sk, entity: {} };
+    const doc = client();
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof QueryCommand) return { Items: [sidecar] };
+      if (command instanceof GetCommand) return { Item: owner };
+      return {};
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
+    const where: CleanedWhere[] = [{ field: "email", operator: "eq", value: "A@EXAMPLE.COM", mode: "insensitive", connector: "AND" }, eq("role", "admin")];
+
+    await expect(store.findMany("user", where, 10)).resolves.toEqual([owner.entity]);
+    expect((doc.send.mock.calls[0]?.[0] as QueryCommand).input.ExpressionAttributeValues?.[":pk"]).toBe(indexPk("user", "role", "admin"));
+  });
+
+  it("preserves indexed IN owner order when owner reads complete out of order", async () => {
+    const owners = ["u1", "u2"].map((id) => ({ pk: modelPk("user"), sk: entitySk(id), id, role: "admin", entity: { id, role: "admin" }, ...rev }));
+    const sidecars = owners.map((owner) => ({ pk: indexPk("user", "role", "admin"), sk: indexSk(owner.id), ownerPk: owner.pk, ownerSk: owner.sk, entity: {} }));
+    let releaseSecond!: () => void;
+    const secondReady = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const doc = client();
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof QueryCommand) return { Items: sidecars };
+      if (command instanceof GetCommand && command.input.Key?.sk === entitySk("u1")) {
+        await secondReady;
+        return { Item: owners[0] };
+      }
+      if (command instanceof GetCommand) {
+        releaseSecond();
+        return { Item: owners[1] };
+      }
+      return {};
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, maxBulkConcurrency: 2 });
+
+    await expect(store.findMany("user", [eq("role", "admin")], 10)).resolves.toEqual(owners.map((owner) => owner.entity));
+  });
+
+  it("makes an empty indexed IN predicate a no-op", async () => {
+    const doc = client();
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never });
+    await expect(store.findMany("user", [{ field: "id", operator: "in", value: [], mode: "sensitive" } as never], 10)).resolves.toEqual([]);
+    expect(doc.send).not.toHaveBeenCalled();
+  });
+
+  it("enforces a global indexed IN page budget", async () => {
+    const doc = client();
+    doc.send.mockImplementation(async (command) => command instanceof QueryCommand ? { Items: [], LastEvaluatedKey: { pk: "next", sk: "next" } } : {});
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, maxPages: 2 });
+    await expect(store.findMany("user", [{ field: "email", operator: "in", value: ["a", "b"], mode: "sensitive" } as never], 10)).rejects.toThrow(/global pagination budget/);
+    expect(doc.send.mock.calls.filter(([command]) => command instanceof QueryCommand)).toHaveLength(2);
+  });
+
+  it("bounds bulk scheduling and waits for started work after a partial failure", async () => {
+    const rows = ["u1", "u2", "u3", "u4"].map((id) => ({ pk: modelPk("user"), sk: entitySk(id), id, entity: { id }, ...rev }));
+    const doc = client(rows);
+    let active = 0;
+    let peak = 0;
+    let calls = 0;
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof ScanCommand) return { Items: rows };
+      if (command instanceof TransactWriteCommand) {
+        calls += 1;
+        const callNumber = calls;
+        active += 1;
+        peak = Math.max(peak, active);
+        await Promise.resolve();
+        active -= 1;
+        if (callNumber === 1) throw new Error("partial failure");
+      }
+      return {};
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, unsafeAllowScan: true, maxBulkConcurrency: 2 });
+    await expect(store.updateMany("user", [], { role: "user" })).rejects.toThrow("partial failure");
+    expect(peak).toBeLessThanOrEqual(2);
+    expect(calls).toBeLessThanOrEqual(2);
+    expect(active).toBe(0);
+  });
+
+  it("surfaces an undefined bulk rejection after stopping new work", async () => {
+    const row = { pk: modelPk("user"), sk: entitySk("u1"), id: "u1", entity: { id: "u1" }, ...rev };
+    const doc = client([row]);
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof ScanCommand) return { Items: [row] };
+      throw undefined;
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, unsafeAllowScan: true });
+    await expect(store.updateMany("user", [], { role: "user" })).rejects.toBeUndefined();
+  });
+
+  it("surfaces the first bulk failure when concurrent in-flight workers also fail", async () => {
+    const rows = ["u1", "u2"].map((id) => ({ pk: modelPk("user"), sk: entitySk(id), id, entity: { id }, ...rev }));
+    const doc = client(rows);
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    doc.send.mockImplementation(async (command) => {
+      if (command instanceof ScanCommand) return { Items: rows };
+      const sk = (command as TransactWriteCommand).input.TransactItems?.[0]?.Put?.Item?.sk;
+      if (sk === entitySk("u1")) {
+        await firstGate;
+        throw new Error("first failure");
+      }
+      releaseFirst();
+      await Promise.resolve();
+      throw new Error("second failure");
+    });
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, unsafeAllowScan: true, maxBulkConcurrency: 2 });
+    await expect(store.updateMany("user", [], { role: "user" })).rejects.toThrow("first failure");
   });
 
   it("paginates explicit scans for count and hides logically expired rows", async () => {

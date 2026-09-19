@@ -7,12 +7,18 @@ export function planQuery(where: CleanedWhere[] = [], allowScan = false): QueryP
   assertSupportedOperators(where);
   const keyedProblem = keyedAccessProblem(where);
   if (keyedProblem) return scanOrThrow(where, allowScan, keyedProblem);
-  const id = eqWhere(where, "id");
-  if (id) return { kind: "byId", where };
-  const unique = firstEquality(where);
-  if (unique) return { kind: "byFieldValue", where };
+  const keyed = keyedPlan(where);
+  if (keyed) return keyed;
   if (allowScan) return { kind: "byModel", where };
   throw new UnsupportedQueryError("Query requires a table scan. Pass unsafeAllowScan to enable bounded scans explicitly.");
+}
+
+function keyedPlan(where: CleanedWhere[]): QueryPlan | undefined {
+  if (eqWhere(where, "id")) return { kind: "byId", where };
+  if (inWhere(where, "id")) return { kind: "byIdValues", where };
+  if (firstEquality(where)) return { kind: "byFieldValue", where };
+  if (safeInWhere(where)) return { kind: "byFieldValues", where };
+  return undefined;
 }
 
 export function matchesWhere(item: Record<string, unknown>, where: CleanedWhere[] = []): boolean {
@@ -22,6 +28,18 @@ export function matchesWhere(item: Record<string, unknown>, where: CleanedWhere[
 
 export function firstEquality(where: CleanedWhere[] = []): CleanedWhere | undefined {
   return where.find((w) => isKeyedEquality(w) && isScalar(w.value));
+}
+
+export function inWhere(where: CleanedWhere[], field: string): CleanedWhere | undefined {
+  return where.find((w) => w.field === field && w.operator === "in" && isScalarArray(w.value));
+}
+
+export function scalarValues(clause: CleanedWhere): (string | number | boolean | Date | null)[] {
+  return Array.isArray(clause.value) ? clause.value.filter(isScalar) as (string | number | boolean | Date | null)[] : [];
+}
+
+export function safeInWhere(where: CleanedWhere[]): CleanedWhere | undefined {
+  return where.find(isSafeIn);
 }
 
 export function eqWhere(where: CleanedWhere[], field: string): CleanedWhere | undefined {
@@ -70,7 +88,7 @@ function combine(acc: boolean, value: boolean, connector: "AND" | "OR" | undefin
 function keyedAccessProblem(where: CleanedWhere[]): string | undefined {
   if (hasOrPredicate(where)) return "OR predicates cannot use DynamoDB keyed access without risking incomplete results. Pass unsafeAllowScan: true to evaluate OR predicates with an explicit bounded scan.";
   if (hasSafeKeyedEquality(where)) return undefined;
-  if (hasInsensitiveEquality(where)) return "Case-insensitive equality cannot use DynamoDB keyed access because id and scalar sidecar keys are case-sensitive. Pass unsafeAllowScan: true to evaluate it with an explicit bounded scan.";
+  if (hasInsensitiveEquality(where)) return "Case-insensitive equality cannot use DynamoDB keyed access (including case-insensitive IN) because id and scalar sidecar keys are case-sensitive. Pass unsafeAllowScan: true to evaluate it with an explicit bounded scan.";
   return undefined;
 }
 
@@ -84,11 +102,15 @@ function hasOrPredicate(where: CleanedWhere[]): boolean {
 }
 
 function hasSafeKeyedEquality(where: CleanedWhere[]): boolean {
-  return where.some((clause) => isKeyedEquality(clause) && isScalar(clause.value));
+  return where.some((clause) => (isKeyedEquality(clause) && isScalar(clause.value)) || isSafeIn(clause));
 }
 
 function hasInsensitiveEquality(where: CleanedWhere[]): boolean {
-  return where.some((clause) => clause.operator === "eq" && clause.mode === "insensitive");
+  return where.some((clause) => clause.mode === "insensitive" && (clause.operator === "eq" || clause.operator === "in"));
+}
+
+function isSafeIn(clause: CleanedWhere): boolean {
+  return clause.operator === "in" && clause.mode !== "insensitive" && isScalarArray(clause.value);
 }
 
 function isKeyedEquality(clause: CleanedWhere): boolean {
@@ -97,6 +119,7 @@ function isKeyedEquality(clause: CleanedWhere): boolean {
 
 function normalize(value: unknown, insensitive: boolean): any {
   if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) return value.map((entry) => normalize(entry, insensitive));
   if (typeof value === "string" && insensitive) return value.toLowerCase();
   return value;
 }
@@ -104,3 +127,5 @@ function normalize(value: unknown, insensitive: boolean): any {
 function isScalar(value: unknown): boolean {
   return value === null || ["string", "number", "boolean"].includes(typeof value) || value instanceof Date;
 }
+
+function isScalarArray(value: unknown): boolean { return Array.isArray(value) && value.every(isScalar); }
