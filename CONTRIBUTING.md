@@ -37,6 +37,13 @@ Useful focused commands:
 
 Update `README.md` for public API, option, storage-layout, table provisioning, concurrency, or limitation changes. Update `AGENTS.md` if contributor rules or invariants change.
 
+## Releasing
+
+1. On a release branch, bump `version` in `package.json`, finalize the `CHANGELOG.md` entry (date and compare link), and update the README upgrade note if needed.
+2. Merge the release PR after `ci` passes.
+3. Tag the merge commit on `main` and push the tag: `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`.
+4. The `publish` workflow runs `bun run verify`, checks that the tag matches `package.json`, and publishes to npm with provenance using npm trusted publishing (OIDC). It has no npm token; the repository and workflow file must be registered as a trusted publisher for `@bjorntech/betterauth-dynamodb` on npmjs.com.
+
 ## Public repository hygiene
 
 Do not commit secrets, `.env` files, private infrastructure identifiers, generated `dist/`, or `coverage/`. The project license is MIT; do not add package metadata, security contacts, or governance details unless they are actual project decisions.
