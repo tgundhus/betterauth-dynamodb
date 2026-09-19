@@ -11,6 +11,21 @@ describe("where planning and matching", () => {
     expect(planQuery([clause("email", "eq", "a")]).kind).toBe("byFieldValue");
   });
 
+  it("plans scalar and id IN predicates without scans, including empty IN", () => {
+    expect(planQuery([clause("id", "in", ["u1", "u1", "u2"])]).kind).toBe("byIdValues");
+    expect(planQuery([clause("email", "in", ["a@example.com", "b@example.com"])]).kind).toBe("byFieldValues");
+    expect(planQuery([clause("id", "in", [])]).kind).toBe("byIdValues");
+    expect(() => planQuery([clause("name", "in", ["a"]), clause("role", "eq", "admin", { connector: "OR" })])).toThrow(UnsupportedQueryError);
+  });
+
+  it("refuses case-insensitive IN keyed access unless another safe anchor exists", () => {
+    const insensitiveIn = clause("email", "in", ["A@EXAMPLE.COM"], { mode: "insensitive" });
+    expect(() => planQuery([insensitiveIn])).toThrow(/case-sensitive/);
+    expect(planQuery([insensitiveIn], true).kind).toBe("byModel");
+    expect(planQuery([eqClause("id", "u1"), insensitiveIn]).kind).toBe("byId");
+    expect(matchesWhere({ email: "a@example.com" }, [insensitiveIn])).toBe(true);
+  });
+
   it("rejects OR predicates instead of narrowing to one keyed branch", () => {
     const where = [clause("email", "eq", "a@example.com"), clause("role", "eq", "admin", { connector: "OR" })];
     expect(() => planQuery(where)).toThrow(UnsupportedQueryError);
@@ -63,3 +78,7 @@ describe("where planning and matching", () => {
     expect(() => planQuery(where)).toThrow(/Unsupported Better Auth where operator "regex"/);
   });
 });
+
+function eqClause(field: string, value: string): CleanedWhere {
+  return clause(field, "eq", value);
+}

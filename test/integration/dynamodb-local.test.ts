@@ -6,13 +6,15 @@ import {
   ResourceNotFoundException,
   waitUntilTableExists
 } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { DeleteCommand, DynamoDBDocumentClient, GetCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
-import { DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../../src/index.js";
+import { betterAuth } from "better-auth";
+import { oauthProvider } from "@better-auth/oauth-provider";
+import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../../src/index.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
-import { entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../../src/keys.js";
+import { compoundUniqueIndexName, compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../../src/serialize.js";
 
 const IMAGE = "amazon/dynamodb-local:2.6.1";
@@ -20,7 +22,7 @@ const REGION = "us-east-1";
 const PORT = 8000;
 
 type TestAdapter = ReturnType<ReturnType<typeof dynamoDBAdapter>>;
-type Where = { field: string; value: string | number | boolean | null; operator: "eq" | "contains"; connector: "AND"; mode: "sensitive" };
+type Where = { field: string; value: string | number | boolean | string[] | number[] | null; operator: "eq" | "in" | "contains"; connector: "AND"; mode: "sensitive" | "insensitive" };
 
 let container: StartedTestContainer;
 let endpoint: string;
@@ -29,6 +31,8 @@ let docClient: DynamoDBDocumentClient;
 let tableName: string;
 
 const eq = (field: string, value: string | number | boolean | null): Where => ({ field, value, operator: "eq", connector: "AND", mode: "sensitive" });
+const inValues = (field: string, value: string[]): Where => ({ field, value, operator: "in", connector: "AND", mode: "sensitive" });
+const insensitiveInValues = (field: string, value: string[]): Where => ({ field, value, operator: "in", connector: "AND", mode: "insensitive" });
 const contains = (field: string, value: string): Where => ({ field, value, operator: "contains", connector: "AND", mode: "sensitive" });
 
 describe("DynamoDB Local adapter integration", () => {
@@ -196,6 +200,14 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(adapter.findMany({ model: "session", where: [eq("userId", "u1")], limit: 10 })).resolves.toEqual([]);
   });
 
+  it("stores epoch-zero TTL explicitly and treats the row as logically expired", async () => {
+    const adapter = adapterFor({ client: docClient, ttl: { fields: { session: "expiresAt" } } });
+    await create(adapter, "session", { id: "epoch-zero", token: "epoch-zero-token", userId: "u1", expiresAt: new Date(0) });
+
+    await expect(rawRow(modelPk("session"), entitySk("epoch-zero"))).resolves.toMatchObject({ ttl: 0 });
+    await expect(adapter.findOne({ model: "session", where: [eq("id", "epoch-zero")] })).resolves.toBeNull();
+  });
+
   it("keeps configured future TTL rows visible while storing physical TTL metadata", async () => {
     const adapter = adapterFor({ client: docClient, ttl: { attributeName: "expiresAtTtl", fields: { plugin: "expiresAt" } } });
     await create(adapter, "plugin", { id: "active", externalId: "ext-active", kind: "ttl", ttl: 1, name: "ordinary", expiresAt: "2030-01-01T00:00:00.000Z" });
@@ -235,6 +247,212 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(adapter.findOne({ model: "plugin", where: [eq("externalId", longValue)] })).resolves.toMatchObject({ id: "id#with:delimiters", externalId: longValue });
     await expect(rawRow(indexPk("plugin", "externalId", longValue), indexSk("id#with:delimiters"))).resolves.toMatchObject({ ownerSk: entitySk("id#with:delimiters") });
   });
+
+  it("keeps schema compound indexes opt-in for backwards compatibility", async () => {
+    const adapter = schemaIndexAdapter(false);
+    await create(adapter, "oauthClientResource", { id: "legacy-1", clientId: "client-1", resourceId: "resource-1" });
+    await expect(create(adapter, "oauthClientResource", { id: "legacy-2", clientId: "client-1", resourceId: "resource-1" })).resolves.toMatchObject({ id: "legacy-2" });
+  });
+
+  it("enforces a real schema compound unique index atomically", async () => {
+    const adapter = schemaIndexAdapter(true);
+    const attempts = await Promise.allSettled([
+      create(adapter, "oauthClientResource", { id: "compound-1", clientId: "client-1", resourceId: "resource-1" }),
+      create(adapter, "oauthClientResource", { id: "compound-2", clientId: "client-1", resourceId: "resource-1" })
+    ]);
+
+    expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
+    expect(attempts.filter((attempt) => attempt.status === "rejected")).toHaveLength(1);
+    await expect(adapter.findMany({ model: "oauthClientResource", where: [eq("clientId", "client-1")], limit: 10 })).resolves.toHaveLength(1);
+  });
+
+  it("cleans compound locks across conflicting update and delete operations", async () => {
+    const adapter = schemaIndexAdapter(true);
+    await create(adapter, "oauthClientResource", { id: "compound-a", clientId: "client-a", resourceId: "resource-a" });
+    await create(adapter, "oauthClientResource", { id: "compound-b", clientId: "client-b", resourceId: "resource-b" });
+
+    await expect(adapter.update({ model: "oauthClientResource", where: [eq("id", "compound-b")], update: { clientId: "client-a", resourceId: "resource-a" } })).rejects.toBeInstanceOf(DynamoDBConflictError);
+    await expect(adapter.delete({ model: "oauthClientResource", where: [eq("id", "compound-a")] })).resolves.toBeUndefined();
+    await expect(adapter.update({ model: "oauthClientResource", where: [eq("id", "compound-b")], update: { clientId: "client-a", resourceId: "resource-a" } })).resolves.toMatchObject({ id: "compound-b", clientId: "client-a", resourceId: "resource-a" });
+  });
+
+  it("supports indexed IN reads, empty IN, pagination, and deterministic limits", async () => {
+    const adapter = schemaIndexAdapter(true);
+    for (let index = 0; index < 7; index += 1) {
+      await create(adapter, "oauthClientResource", { id: `in-${index}`, clientId: "client-in", resourceId: `resource-${index}` });
+    }
+
+    const where = [inValues("resourceId", ["resource-1", "resource-2", "resource-3", "resource-4", "resource-5", "resource-6"])] as never;
+    await expect(adapter.findMany({ model: "oauthClientResource", where, limit: 3, offset: 0 })).resolves.toHaveLength(3);
+    await expect(adapter.findMany({ model: "oauthClientResource", where, limit: 3, offset: 3 })).resolves.toHaveLength(3);
+    await expect(adapter.findMany({ model: "oauthClientResource", where: [inValues("resourceId", [])], limit: 10 })).resolves.toEqual([]);
+  });
+
+  it("combines case-insensitive IN with a case-sensitive indexed IN clause", async () => {
+    const adapter = adapterFor({ client: docClient });
+    await create(adapter, "member", { id: "mixed-mode", email: "a@example.com", role: "admin", organizationId: "org-mixed", active: true });
+
+    await expect(adapter.findMany({ model: "member", where: [insensitiveInValues("email", ["A@EXAMPLE.COM"]), inValues("role", ["admin"])] as never, limit: 10 })).resolves.toEqual([expect.objectContaining({ id: "mixed-mode" })]);
+  });
+
+  it("accepts exactly 1,000 distinct indexed IN values and rejects 1,001 before reading", async () => {
+    const accepted = schemaIndexAdapter(true, 1000);
+    const values = Array.from({ length: 1000 }, (_, index) => `resource-${index}`);
+    await expect(accepted.findMany({ model: "oauthClientResource", where: [inValues("resourceId", values)] as never, limit: 10 })).resolves.toEqual([]);
+
+    const sends = { count: 0 };
+    const rejecting = schemaIndexAdapterWithClient(true, countingClient(sends));
+    const tooMany = Array.from({ length: 1001 }, (_, index) => `resource-${index}`);
+    await expect(rejecting.findMany({ model: "oauthClientResource", where: [inValues("resourceId", tooMany)] as never, limit: 10 })).rejects.toBeInstanceOf(DynamoDBAdapterError);
+    expect(sends.count).toBe(0);
+  });
+
+  it("rejects a transaction over 100 actions before writing", async () => {
+    const sends = { count: 0 };
+    const adapter = adapterFor({ client: countingClient(sends) });
+    const data: Record<string, unknown> = { id: "too-many-actions" };
+    for (let index = 0; index < 99; index += 1) data[`field-${index}`] = `value-${index}`;
+
+    await expect(create(adapter, "wide", data)).rejects.toThrow("exceeding DynamoDB TransactWrite limit 100");
+    expect(sends.count).toBe(0);
+    await expect(rawRowsByModel("wide")).resolves.toEqual([]);
+  });
+
+  it("updates and removes more than one hundred indexed-IN entities without residual sidecars", async () => {
+    const adapter = schemaIndexAdapter(true);
+    for (let index = 0; index < 125; index += 1) {
+      await create(adapter, "oauthClientResource", { id: `bulk-${index}`, clientId: "bulk-client", resourceId: `bulk-resource-${index}` });
+    }
+    const ids = Array.from({ length: 125 }, (_, index) => `bulk-${index}`);
+    const where = [inValues("id", ids)] as never;
+
+    await expect(adapter.updateMany({ model: "oauthClientResource", where, update: { clientId: "bulk-updated" } })).resolves.toBe(125);
+    await expect(adapter.findMany({ model: "oauthClientResource", where: [eq("clientId", "bulk-updated")], limit: 200 })).resolves.toHaveLength(125);
+    await expect(adapter.deleteMany({ model: "oauthClientResource", where })).resolves.toBe(125);
+    await expect(adapter.findMany({ model: "oauthClientResource", where: [eq("clientId", "bulk-updated")], limit: 200 })).resolves.toEqual([]);
+    await expect(rawRowsByModel("_index_oauthClientResource")).resolves.toHaveLength(0);
+  });
+
+  it("requires physical TTL cleanup before replacing an expired compound-index record", async () => {
+    const adapter = dynamoDBAdapter({ tableName, client: docClient, ttl: { fields: { oauthClientResource: "expiresAt" } }, enforceSchemaUniqueIndexes: true } as never)(schemaAuthOptions() as never) as TestAdapter;
+    await create(adapter, "oauthClientResource", { id: "expired-compound", clientId: "client-expired", resourceId: "resource-expired", expiresAt: "2000-01-01T00:00:00.000Z" });
+    await expect(adapter.findMany({ model: "oauthClientResource", where: [eq("clientId", "client-expired")], limit: 10 })).resolves.toEqual([]);
+    await expect(create(adapter, "oauthClientResource", { id: "blocked-compound", clientId: "client-expired", resourceId: "resource-expired" })).rejects.toBeInstanceOf(DynamoDBConflictError);
+    await deleteAllRows();
+    await expect(create(adapter, "oauthClientResource", { id: "fresh-compound", clientId: "client-expired", resourceId: "resource-expired" })).resolves.toMatchObject({ id: "fresh-compound" });
+  });
+
+  it("runs the real Better Auth email/password and session HTTP flow", async () => {
+    const auth = betterAuth({
+      secret: "test-secret-that-is-long-enough-for-better-auth",
+      baseURL: "http://localhost:3000",
+      database: dynamoDBAdapter({ tableName, client: docClient }),
+      emailAndPassword: { enabled: true },
+      rateLimit: { enabled: false }
+    });
+    const signUp = await auth.handler(jsonRequest("/api/auth/sign-up/email", { email: "http@example.com", password: "password-123", name: "HTTP User" }));
+    expect(signUp.status).toBe(200);
+    const signIn = await auth.handler(jsonRequest("/api/auth/sign-in/email", { email: "http@example.com", password: "password-123" }));
+    expect(signIn.status).toBe(200);
+    const cookie = signIn.headers.get("set-cookie")?.split(";", 1)[0];
+    expect(cookie).toMatch(/^better-auth\.session_token=/);
+    const session = await auth.handler(new Request("http://localhost:3000/api/auth/get-session", { headers: { cookie: cookie ?? "" } }));
+    expect(session.status).toBe(200);
+    await expect(session.json()).resolves.toMatchObject({ user: { email: "http@example.com" } });
+  });
+
+  it("uses the published OAuth provider schema for resource IN and refresh-family cleanup", async () => {
+    const adapter = realProviderAdapter(true);
+    await create(adapter, "oauthClientResource", { id: "provider-resource-1", clientId: "provider-client", resourceId: "resource-a" });
+    await create(adapter, "oauthClientResource", { id: "provider-resource-2", clientId: "provider-client", resourceId: "resource-b" });
+    await expect(create(adapter, "oauthClientResource", { id: "provider-resource-duplicate", clientId: "provider-client", resourceId: "resource-a" })).rejects.toBeInstanceOf(DynamoDBConflictError);
+    await expect(adapter.findMany({ model: "oauthClientResource", where: [inValues("resourceId", ["resource-a", "resource-b"])], limit: 10 })).resolves.toHaveLength(2);
+
+    await create(adapter, "oauthRefreshToken", { id: "refresh-family", token: "refresh-token", clientId: "provider-client", userId: "provider-user", scopes: [] });
+    await create(adapter, "oauthAccessToken", { id: "access-family-1", token: "access-token-1", clientId: "provider-client", userId: "provider-user", refreshId: "refresh-family", scopes: [] });
+    await create(adapter, "oauthAccessToken", { id: "access-family-2", token: "access-token-2", clientId: "provider-client", userId: "provider-user", refreshId: "refresh-family", scopes: [] });
+    await expect(adapter.deleteMany({ model: "oauthAccessToken", where: [inValues("refreshId", ["refresh-family"])] })).resolves.toBe(2);
+    await expect(adapter.findOne({ model: "oauthAccessToken", where: [eq("id", "access-family-1")] })).resolves.toBeNull();
+  });
+
+  it("does not let a stale scalar delete remove a replacement lock after simulated TTL cleanup", async () => {
+    const pause = new TransactionPause();
+    const options = { client: docClient, uniqueFields: { user: ["email"] } };
+    const normal = adapterFor(options);
+    const stale = adapterFor({ ...options, client: clientWithTransactionPause(pause) });
+    await create(normal, "user", { id: "scalar-owner-a", email: "race@example.com" });
+
+    const oldDelete = stale.delete({ model: "user", where: [eq("id", "scalar-owner-a")] });
+    await pause.waitUntilPaused();
+    await docClient.send(new DeleteCommand({ TableName: tableName, Key: { pk: uniquePk("user", "email"), sk: valueSk("race@example.com", "") } }));
+    await create(normal, "user", { id: "scalar-owner-b", email: "race@example.com" });
+    pause.release();
+    await oldDelete.catch(() => undefined);
+
+    await expect(rawRow(uniquePk("user", "email"), valueSk("race@example.com", ""))).resolves.toMatchObject({ ownerSk: entitySk("scalar-owner-b") });
+    await expect(create(normal, "user", { id: "scalar-owner-c", email: "race@example.com" })).rejects.toBeInstanceOf(DynamoDBConflictError);
+  });
+
+  it("does not let a stale compound delete remove a replacement lock after simulated TTL cleanup", async () => {
+    const pause = new TransactionPause();
+    const normal = schemaIndexAdapter(true);
+    const stale = schemaIndexAdapterWithClient(true, clientWithTransactionPause(pause));
+    await create(normal, "oauthClientResource", { id: "compound-owner-a", clientId: "race-client", resourceId: "race-resource" });
+
+    const oldDelete = stale.delete({ model: "oauthClientResource", where: [eq("id", "compound-owner-a")] });
+    await pause.waitUntilPaused();
+    await docClient.send(new DeleteCommand({ TableName: tableName, Key: { pk: compoundUniquePk("oauthClientResource", compoundUniqueIndexName(["clientId", "resourceId"])), sk: compoundUniqueSk(["race-client", "race-resource"]) } }));
+    await create(normal, "oauthClientResource", { id: "compound-owner-b", clientId: "race-client", resourceId: "race-resource" });
+    pause.release();
+    await oldDelete.catch(() => undefined);
+
+    await expect(rawRow(compoundUniquePk("oauthClientResource", compoundUniqueIndexName(["clientId", "resourceId"])), compoundUniqueSk(["race-client", "race-resource"]))).resolves.toMatchObject({ ownerSk: entitySk("compound-owner-b") });
+    await expect(create(normal, "oauthClientResource", { id: "compound-owner-c", clientId: "race-client", resourceId: "race-resource" })).rejects.toBeInstanceOf(DynamoDBConflictError);
+  });
+
+  it("preserves replacement ownership when a stale update retains a scalar lock", async () => {
+    const pause = new TransactionPause();
+    const options = { client: docClient, uniqueFields: { user: ["email"] }, ttl: { fields: { user: "expiresAt" } } };
+    const normal = adapterFor(options);
+    const stale = adapterFor({ ...options, client: clientWithTransactionPause(pause) });
+    await create(normal, "user", { id: "retained-owner-a", email: "retained@example.com", expiresAt: "2030-01-01T00:00:00.000Z" });
+
+    const oldUpdate = stale.update({ model: "user", where: [eq("id", "retained-owner-a")], update: { expiresAt: "2031-01-01T00:00:00.000Z" } });
+    await pause.waitUntilPaused();
+    await docClient.send(new DeleteCommand({ TableName: tableName, Key: { pk: uniquePk("user", "email"), sk: valueSk("retained@example.com", "") } }));
+    await create(normal, "user", { id: "retained-owner-b", email: "retained@example.com" });
+    pause.release();
+    await oldUpdate.catch(() => undefined);
+
+    await expect(rawRow(uniquePk("user", "email"), valueSk("retained@example.com", ""))).resolves.toMatchObject({ ownerSk: entitySk("retained-owner-b") });
+    await expect(create(normal, "user", { id: "retained-owner-c", email: "retained@example.com" })).rejects.toBeInstanceOf(DynamoDBConflictError);
+  });
+
+  it("allows a legitimate delete to complete when its lock was already physically removed", async () => {
+    const adapter = schemaIndexAdapter(true);
+    await create(adapter, "oauthClientResource", { id: "lockless-owner", clientId: "lockless-client", resourceId: "lockless-resource" });
+    await docClient.send(new DeleteCommand({ TableName: tableName, Key: { pk: compoundUniquePk("oauthClientResource", compoundUniqueIndexName(["clientId", "resourceId"])), sk: compoundUniqueSk(["lockless-client", "lockless-resource"]) } }));
+
+    await expect(adapter.delete({ model: "oauthClientResource", where: [eq("id", "lockless-owner")] })).resolves.toBeUndefined();
+    await expect(adapter.findOne({ model: "oauthClientResource", where: [eq("id", "lockless-owner")] })).resolves.toBeNull();
+  });
+
+  it("stops scheduling new bulk writes after an observed transaction failure", async () => {
+    let started = 0;
+    const failingClient = { send: async (command: any) => {
+      if (command instanceof TransactWriteCommand) {
+        started += 1;
+        if (started === 3) throw new Error("synthetic bulk failure");
+      }
+      return docClient.send(command);
+    } } as unknown as DynamoDBDocumentClient;
+    const normal = adapterFor({ client: docClient });
+    const failing = adapterFor({ client: failingClient, maxBulkConcurrency: 2 });
+    for (let index = 0; index < 12; index += 1) await create(normal, "plugin", { id: `bulk-failure-${index}`, externalId: `bulk-failure-${index}`, kind: "failure" });
+
+    await expect(failing.updateMany({ model: "plugin", where: [inValues("id", Array.from({ length: 12 }, (_, index) => `bulk-failure-${index}`))] as never, update: { name: "partial" } })).rejects.toThrow("synthetic bulk failure");
+    expect(started).toBeLessThan(12);
+  });
 });
 
 function adapterFor(options: Omit<BetterAuthDynamoDBOptions, "tableName">): TestAdapter {
@@ -252,12 +470,51 @@ function authOptions() {
       {
         id: "integration-schema",
         schema: {
-          member: { fields: { organizationId: { type: "string", required: true }, role: { type: "string", required: true }, active: { type: "boolean", required: true } } },
+          member: { fields: { organizationId: { type: "string", required: true }, role: { type: "string", required: true }, email: { type: "string", required: true }, active: { type: "boolean", required: true } } },
+          wide: { fields: Object.fromEntries(Array.from({ length: 99 }, (_, index) => [`field-${index}`, { type: "string", required: false }])) },
           plugin: { fields: { externalId: { type: "string", required: true, unique: true }, kind: { type: "string", required: true }, ttl: { type: "number", required: false }, name: { type: "string", required: false }, expiresAt: { type: "string", required: false } } }
         }
       }
     ]
   };
+}
+
+function schemaAuthOptions() {
+  return {
+    secret: "test-secret",
+    emailAndPassword: { enabled: true },
+    plugins: [
+      {
+        id: "oauth-provider-schema",
+        schema: {
+          oauthClientResource: {
+            fields: {
+              clientId: { type: "string", required: true },
+              resourceId: { type: "string", required: true },
+              expiresAt: { type: "string", required: false }
+            },
+            indexes: [{ fields: ["clientId", "resourceId"], unique: true }]
+          }
+        }
+      }
+    ]
+  };
+}
+
+function schemaIndexAdapter(enforce: boolean, maxPages?: number): TestAdapter {
+  return dynamoDBAdapter({ tableName, client: docClient, ...(maxPages ? { maxPages } : {}), ...(enforce ? { enforceSchemaUniqueIndexes: true } : {}) } as never)(schemaAuthOptions() as never) as TestAdapter;
+}
+
+function schemaIndexAdapterWithClient(enforce: boolean, client: DynamoDBDocumentClient): TestAdapter {
+  return dynamoDBAdapter({ tableName, client, ...(enforce ? { enforceSchemaUniqueIndexes: true } : {}) } as never)(schemaAuthOptions() as never) as TestAdapter;
+}
+
+function realProviderAdapter(enforce: boolean): TestAdapter {
+  return dynamoDBAdapter({ tableName, client: docClient, ...(enforce ? { enforceSchemaUniqueIndexes: true } : {}) } as never)({ secret: "test-secret", plugins: [oauthProvider({ loginPage: "/login", consentPage: "/consent" })] } as never) as TestAdapter;
+}
+
+function jsonRequest(path: string, body: Record<string, unknown>): Request {
+  return new Request(`http://localhost:3000${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 }
 
 function create(adapter: TestAdapter, model: string, data: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -278,6 +535,50 @@ class ReadBarrier {
     }
     return new Promise((resolve) => this.waiters.push(resolve));
   }
+}
+
+class TransactionPause {
+  private paused = false;
+  private readonly pausedPromise: Promise<void>;
+  private markPaused!: () => void;
+  private releaseTransaction!: () => void;
+
+  constructor() {
+    this.pausedPromise = new Promise((resolve) => { this.markPaused = resolve; });
+  }
+
+  async waitUntilPaused(timeoutMs = 5_000): Promise<void> {
+    let timer: ReturnType<typeof setTimeout>;
+    try {
+      await Promise.race([
+        this.pausedPromise,
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`Timed out waiting for transaction pause after ${timeoutMs}ms`)), timeoutMs); })
+      ]);
+    } finally {
+      clearTimeout(timer!);
+    }
+  }
+
+  pause(): Promise<void> {
+    if (!this.paused) {
+      this.paused = true;
+      this.markPaused();
+    }
+    return new Promise((resolve) => { this.releaseTransaction = resolve; });
+  }
+
+  release(): void { this.releaseTransaction(); }
+}
+
+function clientWithTransactionPause(pause: TransactionPause): DynamoDBDocumentClient {
+  return { send: async (command) => {
+    if (command instanceof TransactWriteCommand) await pause.pause();
+    return docClient.send(command);
+  } } as DynamoDBDocumentClient;
+}
+
+function countingClient(counter: { count: number }): DynamoDBDocumentClient {
+  return { send: async (command) => { counter.count += 1; return docClient.send(command); } } as DynamoDBDocumentClient;
 }
 
 function clientWithReadBarrier(barrier: ReadBarrier, pk: string, sk: string): DynamoDBDocumentClient {
@@ -338,4 +639,15 @@ async function rawRow(pk: string, sk: string): Promise<Record<string, unknown> |
 async function rawRowsByModel(model: string): Promise<Record<string, unknown>[]> {
   const result = await docClient.send(new ScanCommand({ TableName: tableName, ConsistentRead: true, FilterExpression: "#model = :model", ExpressionAttributeNames: { "#model": "model" }, ExpressionAttributeValues: { ":model": model } }));
   return result.Items ?? [];
+}
+
+async function deleteAllRows(): Promise<void> {
+  let ExclusiveStartKey: Record<string, unknown> | undefined;
+  do {
+    const result = await docClient.send(new ScanCommand({ TableName: tableName, ConsistentRead: true, ExclusiveStartKey }));
+    for (const item of result.Items ?? []) {
+      await docClient.send(new DeleteCommand({ TableName: tableName, Key: { pk: item.pk, sk: item.sk } }));
+    }
+    ExclusiveStartKey = result.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
 }

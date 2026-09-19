@@ -1,5 +1,5 @@
-import { entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "./keys.js";
-import type { SidecarItem, StoredItem, TtlOptions } from "./types.js";
+import { compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "./keys.js";
+import type { SchemaUniqueIndex, SidecarItem, StoredItem, TtlOptions } from "./types.js";
 import { randomUUID } from "node:crypto";
 
 export const REVISION_ATTRIBUTE = "__betterAuthDynamoDBRevision";
@@ -11,7 +11,7 @@ export function toStoredItem(model: string, data: Record<string, unknown>, ttl?:
   const entity = stripUndefined(data);
   const item: StoredItem = { ...entity, pk: modelPk(model), sk: entitySk(id), model, id, entity, [REVISION_ATTRIBUTE]: newRevision() };
   const ttlValue = deriveTtl(model, data, ttl);
-  if (ttlValue) item[ttlAttribute(ttl)] = ttlValue;
+  if (ttlValue !== undefined) item[ttlAttribute(ttl)] = ttlValue;
   if (typeof data.createdAt === "string") item.createdAtSort = data.createdAt;
   if (data.createdAt instanceof Date) item.createdAtSort = data.createdAt.toISOString();
   return item;
@@ -37,6 +37,18 @@ export function toUniqueLocks(model: string, data: Record<string, unknown>, fiel
   const id = requireId(data);
   const ttlValue = deriveTtl(model, data, ttl);
   return fields.flatMap((field) => uniqueLockItem(model, id, field, data[field], ttlValue, ttl));
+}
+
+export function toSchemaUniqueLocks(model: string, data: Record<string, unknown>, indexes: SchemaUniqueIndex[], ttl?: false | TtlOptions): SidecarItem[] {
+  const id = requireId(data);
+  const ttlValue = deriveTtl(model, data, ttl);
+  return indexes.flatMap((index) => {
+    const values = index.fields.map((field) => data[field]);
+    if (values.some((value) => value === undefined || value === null)) return [];
+    const item: SidecarItem = { pk: compoundUniquePk(model, index.name), sk: compoundUniqueSk(values), model: `_unique2_${model}`, id: `${index.name}:${id}`, entity: { ownerPk: modelPk(model), ownerSk: entitySk(id), fields: index.fields, values }, ownerPk: modelPk(model), ownerSk: entitySk(id) };
+    if (ttlValue !== undefined) item[ttlAttribute(ttl)] = ttlValue;
+    return [item];
+  });
 }
 
 export function fromStoredItem<T>(item?: Record<string, unknown> | null, ttlOptions?: false | TtlOptions): T | null {
@@ -105,14 +117,14 @@ function indexEntries(data: Record<string, unknown>): [string, unknown][] {
 
 function sidecarItem(model: string, id: string, field: string, value: unknown, ttlValue: number | undefined, ttl?: false | TtlOptions): SidecarItem {
   const item: SidecarItem = { pk: indexPk(model, field, value), sk: indexSk(id), model: `_index_${model}`, id: `${field}:${id}`, entity: { ownerPk: modelPk(model), ownerSk: entitySk(id), field, value }, ownerPk: modelPk(model), ownerSk: entitySk(id), indexModel: model, indexField: field, indexValue: value };
-  if (ttlValue) item[ttlAttribute(ttl)] = ttlValue;
+  if (ttlValue !== undefined) item[ttlAttribute(ttl)] = ttlValue;
   return item;
 }
 
 function uniqueLockItem(model: string, id: string, field: string, value: unknown, ttlValue: number | undefined, ttl?: false | TtlOptions): SidecarItem[] {
   if (value === undefined || value === null) return [];
   const item: SidecarItem = { pk: uniquePk(model, field), sk: valueSk(value, ""), model: `_unique_${model}`, id: `${field}:${String(value)}`, entity: { ownerPk: modelPk(model), ownerSk: entitySk(id), field, value }, ownerPk: modelPk(model), ownerSk: entitySk(id) };
-  if (ttlValue) item[ttlAttribute(ttl)] = ttlValue;
+  if (ttlValue !== undefined) item[ttlAttribute(ttl)] = ttlValue;
   return [item];
 }
 

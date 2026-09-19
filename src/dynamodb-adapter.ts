@@ -10,24 +10,25 @@ import { randomUUID } from "node:crypto";
 import { createDocumentClient, normalizeOptions } from "./client.js";
 import { DynamoDBAdapterError, DynamoDBConflictError, isConditionalCheckFailed, isConditionalTransactionCanceled, transactionCancellationCodes } from "./errors.js";
 import { entitySk, indexPk, modelPk } from "./keys.js";
-import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, revisionOf, stripUndefined, toIndexSidecars, toStoredItem, toUniqueLocks, ttlAttribute } from "./serialize.js";
-import type { BetterAuthDynamoDBOptions, CleanedWhere, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types.js";
-import { eqWhere, firstEquality, matchesWhere, planQuery } from "./where.js";
+import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, revisionOf, stripUndefined, toIndexSidecars, toSchemaUniqueLocks, toStoredItem, toUniqueLocks, ttlAttribute } from "./serialize.js";
+import type { CleanedWhere, DynamoDBStoreOptions, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types.js";
+import { eqWhere, firstEquality, inWhere, matchesWhere, planQuery, safeInWhere, scalarValues } from "./where.js";
 
 const MAX_TRANSACT_ITEMS = 100;
+const MAX_IN_VALUES = 1000;
 
 export class DynamoDBStore {
   private readonly client: DynamoDBDocumentClient;
-  private readonly options: ReturnType<typeof normalizeOptions>;
+  private readonly options: ReturnType<typeof normalizeOptions<DynamoDBStoreOptions>>;
 
-  constructor(options: BetterAuthDynamoDBOptions) {
+  constructor(options: DynamoDBStoreOptions) {
     this.options = normalizeOptions(options);
     this.client = createDocumentClient(this.options);
   }
 
   async create<T extends Record<string, unknown>>(model: string, data: T): Promise<T> {
     const item = toStoredItem(model, data, this.options.ttl);
-    await this.transactPutNew([item, ...this.sidecars(model, data), ...this.uniqueLocks(model, data)], "create");
+    await this.transactPutNew([item, ...this.allSidecars(model, data)], "create");
     return fromStoredItem<T>(item, this.options.ttl) as T;
   }
 
@@ -80,7 +81,7 @@ export class DynamoDBStore {
 
   async deleteMany(model: string, where: CleanedWhere[]): Promise<number> {
     const targets = await this.matchingTargets(model, where);
-    await Promise.all(targets.map((row) => this.transactDelete(row)));
+    await runBounded(targets, this.options.maxBulkConcurrency, (row) => this.transactDelete(row));
     return targets.length;
   }
 
@@ -122,13 +123,15 @@ export class DynamoDBStore {
   }
 
   private async writeMany(rows: readonly (readonly [StoredItem, Record<string, unknown>])[], model: string): Promise<number> {
-    await Promise.all(rows.map(([row, next]) => this.transactReplace(model, row, toStoredItem(model, next, this.options.ttl))));
+    await runBounded(rows, this.options.maxBulkConcurrency, ([row, next]) => this.transactReplace(model, row, toStoredItem(model, next, this.options.ttl)));
     return rows.length;
   }
 
   private async loadRows(model: string, plan: QueryPlan): Promise<StoredItem[]> {
     if (plan.kind === "byId") return this.loadById(model, plan.where);
+    if (plan.kind === "byIdValues") return this.loadByIds(model, plan.where);
     if (plan.kind === "byFieldValue") return this.loadByField(model, plan.where);
+    if (plan.kind === "byFieldValues") return this.loadByFields(model, plan.where);
     return this.scanModel(model);
   }
 
@@ -151,7 +154,7 @@ export class DynamoDBStore {
   }
 
   async transactCreate(items: { model: string; data: Record<string, unknown> }[]): Promise<void> {
-    await this.transactPutNew(items.flatMap((item) => [toStoredItem(item.model, item.data, this.options.ttl), ...this.sidecars(item.model, item.data), ...this.uniqueLocks(item.model, item.data)]), "transactCreate");
+    await this.transactPutNew(items.flatMap((item) => [toStoredItem(item.model, item.data, this.options.ttl), ...this.allSidecars(item.model, item.data)]), "transactCreate");
   }
 
   private async transactPutNew(items: (StoredItem | SidecarItem)[], operation: string): Promise<void> {
@@ -166,8 +169,8 @@ export class DynamoDBStore {
   }
 
   private async transactReplace(model: string, oldItem: StoredItem, newItem: StoredItem): Promise<void> {
-    const oldSidecars = [...this.sidecars(model, oldItem.entity), ...this.uniqueLocks(model, oldItem.entity)];
-    const newSidecars = [...this.sidecars(model, newItem.entity), ...this.uniqueLocks(model, newItem.entity)];
+    const oldSidecars = this.allSidecars(model, oldItem.entity);
+    const newSidecars = this.allSidecars(model, newItem.entity);
     const deletes = removedSidecars(oldSidecars, newSidecars).map((item) => deleteOf(this.options.tableName, item));
     const puts = addedSidecars(oldSidecars, newSidecars).map((item) => putNewOf(this.options.tableName, item));
     const updates = retainedSidecars(oldSidecars, newSidecars).flatMap(([oldSidecar, newSidecar]) => ttlUpdateOf(this.options.tableName, oldSidecar, newSidecar, this.options.ttl));
@@ -181,23 +184,23 @@ export class DynamoDBStore {
   private async transactDelete(item: StoredItem): Promise<void> {
     const condition = revisionCondition(item);
     const entity = { Delete: { TableName: this.options.tableName, Key: keyOf(item), ConditionExpression: condition.expression, ExpressionAttributeNames: condition.names, ExpressionAttributeValues: condition.values, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
-    const sidecars = [...this.sidecars(String(item.model), item.entity), ...this.uniqueLocks(String(item.model), item.entity)].map((sidecar) => deleteOf(this.options.tableName, sidecar));
+    const sidecars = this.allSidecars(String(item.model), item.entity).map((sidecar) => deleteOf(this.options.tableName, sidecar));
     const actions = [entity, ...sidecars];
     assertTransactionActions(actions);
     await this.client.send(new TransactWriteCommand(transactInput(actions)));
   }
 
   private async transactIncrement(model: string, oldItem: StoredItem, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>): Promise<void> {
-    const oldSidecars = [...this.sidecars(model, oldItem.entity), ...this.uniqueLocks(model, oldItem.entity)];
-    const newSidecars = [...this.sidecars(model, newItem.entity), ...this.uniqueLocks(model, newItem.entity)];
+    const oldSidecars = this.allSidecars(model, oldItem.entity);
+    const newSidecars = this.allSidecars(model, newItem.entity);
     const actions = [incrementUpdateOf(this.options.tableName, oldItem, newItem, increment, set, this.options.ttl), ...removedSidecars(oldSidecars, newSidecars).map((item) => deleteOf(this.options.tableName, item)), ...addedSidecars(oldSidecars, newSidecars).map((item) => putNewOf(this.options.tableName, item)), ...retainedSidecars(oldSidecars, newSidecars).flatMap(([oldSidecar, newSidecar]) => ttlUpdateOf(this.options.tableName, oldSidecar, newSidecar, this.options.ttl))];
     assertTransactionActions(actions);
     await this.client.send(new TransactWriteCommand(transactInput(actions)));
   }
 
-  private async queryAllSidecars(model: string, clause: CleanedWhere): Promise<SidecarItem[]> {
+  private async queryAllSidecars(model: string, clause: CleanedWhere, budget?: { remaining: number }): Promise<SidecarItem[]> {
     const command = sidecarQuery(this.options.tableName, model, clause, this.options.pageSize);
-    return drainPages<SidecarItem>(async (key) => pageOf<SidecarItem>(await this.client.send(new QueryCommand({ ...command, ExclusiveStartKey: key }))), this.options.maxPages);
+    return drainPages<SidecarItem>(async (key) => pageOf<SidecarItem>(await this.client.send(new QueryCommand({ ...command, ExclusiveStartKey: key }))), this.options.maxPages, budget);
   }
 
   private async scanAllModel(model: string): Promise<StoredItem[]> {
@@ -206,7 +209,7 @@ export class DynamoDBStore {
   }
 
   private async loadOwners(sidecars: SidecarItem[], clause: CleanedWhere): Promise<StoredItem[]> {
-    const rows = await Promise.all(sidecars.map((item) => this.loadOwner(item)));
+    const rows = await mapBounded(sidecars, this.options.maxBulkConcurrency, (item) => this.loadOwner(item));
     return rows.filter((row): row is StoredItem => row !== null && matchesWhere(row, [clause]));
   }
 
@@ -224,6 +227,32 @@ export class DynamoDBStore {
 
   private uniqueLocks(model: string, data: Record<string, unknown>): SidecarItem[] {
     return toUniqueLocks(model, data, this.options.uniqueFields?.[model] ?? [], this.options.ttl);
+  }
+
+  private allSidecars(model: string, data: Record<string, unknown>): SidecarItem[] {
+    return [...this.sidecars(model, data), ...this.uniqueLocks(model, data), ...toSchemaUniqueLocks(model, data, (this.options.schemaUniqueIndexes ?? []).filter((index) => index.model === model), this.options.ttl)];
+  }
+
+  private async loadByIds(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
+    const clause = inWhere(where, "id");
+    if (!clause) return [];
+    const ids = [...new Set(scalarValues(clause).map(String))];
+    assertInValueCount(ids.length);
+    const rows: StoredItem[][] = [];
+    for (const id of ids) rows.push(await this.loadById(model, [{ field: "id", operator: "eq", value: id, mode: "sensitive" }]));
+    return rows.flat();
+  }
+
+  private async loadByFields(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
+    const clause = safeInWhere(where);
+    if (!clause) return [];
+    const values = [...new Map(scalarValues(clause).map((value) => [JSON.stringify([typeof value, value instanceof Date ? value.toISOString() : value]), value])).values()];
+    assertInValueCount(values.length);
+    const sidecars: SidecarItem[] = [];
+    const budget = { remaining: this.options.maxPages };
+    for (const value of values) sidecars.push(...await this.queryAllSidecars(model, { ...clause, operator: "eq", value } as CleanedWhere, budget));
+    const unique = new Map(sidecars.map((item) => [sidecarKey(item), item]));
+    return this.loadOwners([...unique.values()], clause);
   }
 }
 
@@ -263,7 +292,7 @@ function dateSortValue(left: unknown, right: unknown): number | null {
 }
 
 function deleteOf(tableName: string, item: SidecarItem) {
-  return { Delete: { TableName: tableName, Key: keyOf(item) } };
+  return { Delete: { TableName: tableName, Key: keyOf(item), ConditionExpression: "attribute_not_exists(#pk) OR (#ownerPk = :ownerPk AND #ownerSk = :ownerSk)", ExpressionAttributeNames: { "#pk": "pk", "#ownerPk": "ownerPk", "#ownerSk": "ownerSk" }, ExpressionAttributeValues: { ":ownerPk": item.ownerPk, ":ownerSk": item.ownerSk }, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
 }
 
 function putNewOf(tableName: string, item: StoredItem | SidecarItem) {
@@ -378,10 +407,16 @@ function removeMetadata(nameToken: string, name: string, names: Record<string, s
 function assertTransactionActions(actions: NonNullable<TransactWriteCommandInput["TransactItems"]>): void {
   assertTransactionSize(actions.length);
   assertNoDuplicateActions(actions);
+  const bytes = Buffer.byteLength(JSON.stringify(actions), "utf8");
+  if (bytes > 4_000_000) throw new Error("Better Auth DynamoDB transaction exceeds the practical 4 MB item-size limit.");
 }
 
 function assertTransactionSize(count: number): void {
   if (count > MAX_TRANSACT_ITEMS) throw new Error(`Better Auth DynamoDB transaction requires ${count} items, exceeding DynamoDB TransactWrite limit ${MAX_TRANSACT_ITEMS}. Reduce indexed scalar fields or split the mutation.`);
+}
+
+function assertInValueCount(count: number): void {
+  if (count > MAX_IN_VALUES) throw new DynamoDBAdapterError(`Better Auth DynamoDB indexed IN predicate contains ${count} distinct values, exceeding the bounded limit of ${MAX_IN_VALUES}. Narrow the predicate.`);
 }
 
 function assertNoDuplicateActions(actions: NonNullable<TransactWriteCommandInput["TransactItems"]>): void {
@@ -463,19 +498,26 @@ function conflictError(operation: string, cause: unknown): DynamoDBConflictError
   return new DynamoDBConflictError(`Better Auth DynamoDB ${operation} conflicted with a concurrent write after the target row was read. Retry the operation.`, { cause });
 }
 
-function drainPages<T>(load: (key?: Record<string, unknown>) => Promise<{ Items?: T[]; LastEvaluatedKey?: Record<string, unknown> }>, maxPages: number): Promise<T[]> {
-  return drainPagesInner(load, maxPages, undefined, [], 0);
+function drainPages<T>(load: (key?: Record<string, unknown>) => Promise<{ Items?: T[]; LastEvaluatedKey?: Record<string, unknown> }>, maxPages: number, budget?: { remaining: number }): Promise<T[]> {
+  return drainPagesInner(load, maxPages, undefined, [], 0, budget);
 }
 
 function pageOf<T>(result: { Items?: Record<string, unknown>[] | undefined; LastEvaluatedKey?: Record<string, unknown> | undefined }): { Items?: T[]; LastEvaluatedKey?: Record<string, unknown> } {
   return { ...(result.Items ? { Items: result.Items as T[] } : {}), ...(result.LastEvaluatedKey ? { LastEvaluatedKey: result.LastEvaluatedKey } : {}) };
 }
 
-async function drainPagesInner<T>(load: (key?: Record<string, unknown>) => Promise<{ Items?: T[]; LastEvaluatedKey?: Record<string, unknown> }>, maxPages: number, key: Record<string, unknown> | undefined, items: T[], page: number): Promise<T[]> {
-  if (page >= maxPages) throw new Error(`Better Auth DynamoDB query exceeded maxPages (${maxPages}) before DynamoDB pagination completed. Increase maxPages or narrow the predicate.`);
+async function drainPagesInner<T>(load: (key?: Record<string, unknown>) => Promise<{ Items?: T[]; LastEvaluatedKey?: Record<string, unknown> }>, maxPages: number, key: Record<string, unknown> | undefined, items: T[], page: number, budget?: { remaining: number }): Promise<T[]> {
+  consumePageBudget(page, maxPages, budget);
   const result = await load(key);
   const next = [...items, ...(result.Items ?? [])];
-  return result.LastEvaluatedKey ? drainPagesInner(load, maxPages, result.LastEvaluatedKey, next, page + 1) : next;
+  return result.LastEvaluatedKey ? drainPagesInner(load, maxPages, result.LastEvaluatedKey, next, page + 1, budget) : next;
+}
+
+function consumePageBudget(page: number, maxPages: number, budget?: { remaining: number }): void {
+  if (!budget && page >= maxPages) throw new Error(`Better Auth DynamoDB query exceeded maxPages (${maxPages}) before DynamoDB pagination completed. Increase maxPages or narrow the predicate.`);
+  if (!budget) return;
+  if (budget.remaining <= 0) throw new Error("Better Auth DynamoDB indexed IN query exceeded the global pagination budget. Increase maxPages or narrow the predicate.");
+  budget.remaining -= 1;
 }
 
 function sidecarQuery(tableName: string, model: string, clause: CleanedWhere, pageSize?: number) {
@@ -505,4 +547,36 @@ function visibleOwner(owner: StoredItem | null, ttl?: false | TtlOptions): Store
 
 function ownerKeyPart(primary: unknown, fallback: unknown): unknown {
   return typeof primary === "string" ? primary : fallback;
+}
+
+/** Runs independent records with bounded parallelism; failures stop new claims and all started work settles before rejection. */
+async function runBounded<T>(items: readonly T[], concurrency: number, operation: (item: T) => Promise<unknown>): Promise<void> {
+  const state = { cursor: 0, failure: undefined as unknown, stopped: false, hasFailure: false };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => runWorker(items, state, operation)));
+  if (state.hasFailure) throw state.failure;
+}
+
+async function runWorker<T>(items: readonly T[], state: { cursor: number; failure: unknown; stopped: boolean; hasFailure: boolean }, operation: (item: T) => Promise<unknown>): Promise<void> {
+  while (true) {
+    if (state.stopped || state.cursor >= items.length) return;
+    const item = items[state.cursor++];
+    if (item === undefined) return;
+    try {
+      await operation(item);
+    } catch (error) {
+      recordFirstFailure(state, error);
+    }
+  }
+}
+
+function recordFirstFailure(state: { failure: unknown; stopped: boolean; hasFailure: boolean }, error: unknown): void {
+  if (!state.hasFailure) state.failure = error;
+  state.hasFailure = true;
+  state.stopped = true;
+}
+
+async function mapBounded<T, R>(items: readonly T[], concurrency: number, operation: (item: T) => Promise<R>): Promise<R[]> {
+  const result = new Array<R>(items.length);
+  await runBounded(items.map((item, index) => ({ item, index })), concurrency, async ({ item, index }) => { result[index] = await operation(item); });
+  return result;
 }

@@ -32,6 +32,20 @@ export function valueSk(value: unknown, id: string): string {
   return checkedSortKey(`VALUE${SEP}${hashValue(value)}${SEP}${component(id)}`, "unique lock sort key");
 }
 
+/** Versioned tuple namespace. Values are hashed only after type-preserving encoding. */
+export function compoundUniquePk(model: string, index: string): string {
+  return checkedPartitionKey(`UNIQUE2${SEP}${component(model)}${SEP}${component(index)}`, "compound unique lock partition key");
+}
+
+/** Stable unnamed-index namespace: preserve declared field order and length-prefix each field. */
+export function compoundUniqueIndexName(fields: string[]): string {
+  return fields.map(component).join(SEP);
+}
+
+export function compoundUniqueSk(values: unknown[]): string {
+  return checkedSortKey(`TUPLE${SEP}${hashValue(JSON.stringify(values.map(encodeValue)))}`, "compound unique lock sort key");
+}
+
 export function encodeValue(value: unknown): string {
   if (value instanceof Date) return value.toISOString();
   if (value === null) return "null:null";

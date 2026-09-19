@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { entitySk, indexPk, indexSk, modelPk, uniquePk } from "../src/keys.js";
-import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, stripUndefined, toIndexSidecars, toStoredItem } from "../src/serialize.js";
+import { compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, modelPk, uniquePk } from "../src/keys.js";
+import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, stripUndefined, toIndexSidecars, toSchemaUniqueLocks, toStoredItem, toUniqueLocks } from "../src/serialize.js";
 
 class CustomValue {
   constructor(
@@ -21,6 +21,18 @@ describe("serialization helpers", () => {
     expect(uniquePk("user#x", "email#work")).toBe("UNIQUE#s6:user#x#s10:email#work");
     expect(a.pk).not.toBe(b.pk);
     expect(a.sk).not.toBe(b.sk);
+  });
+
+  it("uses a versioned, type-preserving namespace for compound unique tuples", () => {
+    expect(compoundUniquePk("user", "email_provider")).toContain("UNIQUE2#");
+    expect(compoundUniqueSk(["1", 2])).not.toBe(compoundUniqueSk([1, "2"]));
+    expect(compoundUniqueSk(["a#b", "c"])).not.toBe(compoundUniqueSk(["a", "b#c"]));
+    expect(compoundUniqueSk(["ab", ""])).not.toBe(compoundUniqueSk(["a", "b"]));
+    expect(toSchemaUniqueLocks("user", { id: "u1", email: "a", provider: "google" }, [{ model: "user", name: "email_provider", fields: ["email", "provider"] }])).toHaveLength(1);
+    expect(toSchemaUniqueLocks("user", { id: "u1", email: null, provider: "google" }, [{ model: "user", name: "email_provider", fields: ["email", "provider"] }])).toHaveLength(0);
+    expect(toSchemaUniqueLocks("user", { id: "u1", provider: "google" }, [{ model: "user", name: "email_provider", fields: ["email", "provider"] }])).toHaveLength(0);
+    expect(toSchemaUniqueLocks("user", { id: "u1", email: "a", provider: undefined }, [{ model: "user", name: "email_provider", fields: ["email", "provider"] }])).toHaveLength(0);
+    expect(toSchemaUniqueLocks("user", { id: "u1", email: "", provider: "google" }, [{ model: "user", name: "email_provider", fields: ["email", "provider"] }])).toHaveLength(1);
   });
 
   it("enforces DynamoDB partition and sort key byte limits at UTF-8 boundaries", () => {
@@ -62,6 +74,13 @@ describe("serialization helpers", () => {
     expect(isLogicallyExpired({ ttl: 1 }, { attributeName: "expiresAtTtl", defaultField: "expiresAt" }, 2)).toBe(false);
     expect(isLogicallyExpired({ expiresAtTtl: 1 }, { attributeName: "expiresAtTtl", defaultField: "expiresAt" }, 2)).toBe(true);
     expect(fromStoredItem(item, { attributeName: "expiresAtTtl", defaultField: "expiresAt" })).toEqual({ id: "s1", ttl: 1, expiresAt: "2030-01-01T00:00:00.000Z" });
+  });
+
+  it("preserves epoch-zero TTL metadata", () => {
+    const item = toStoredItem("session", { id: "s0", expiresAt: "1970-01-01T00:00:00.000Z" }, { defaultField: "expiresAt" });
+    expect(item.ttl).toBe(0);
+    expect(toIndexSidecars("session", item.entity, { defaultField: "expiresAt" })[0]).toHaveProperty("ttl", 0);
+    expect(toUniqueLocks("session", item.entity, ["id"], { defaultField: "expiresAt" })[0]).toHaveProperty("ttl", 0);
   });
 
   it("strips undefined only from arrays and nested plain object records", () => {

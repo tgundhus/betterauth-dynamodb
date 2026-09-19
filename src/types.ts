@@ -12,6 +12,21 @@ export interface BetterAuthDynamoDBOptions {
   maxPages?: number;
   pageSize?: number;
   uniqueFields?: Record<string, string[]>;
+  /** Opt in to Better Auth schema `indexes` unique constraints. */
+  enforceSchemaUniqueIndexes?: boolean;
+  /** Maximum number of independent bulk transactions in flight. */
+  maxBulkConcurrency?: number;
+}
+
+/** Store options: public adapter options plus schema metadata resolved and validated by the adapter factory. */
+export interface DynamoDBStoreOptions extends BetterAuthDynamoDBOptions {
+  schemaUniqueIndexes?: SchemaUniqueIndex[];
+}
+
+export interface SchemaUniqueIndex {
+  model: string;
+  name: string;
+  fields: string[];
 }
 
 export interface TtlOptions {
@@ -54,6 +69,6 @@ export interface CleanedWhere {
 }
 
 export interface QueryPlan {
-  kind: "byId" | "byFieldValue" | "byModel";
+  kind: "byId" | "byIdValues" | "byFieldValue" | "byFieldValues" | "byModel";
   where: CleanedWhere[];
 }
