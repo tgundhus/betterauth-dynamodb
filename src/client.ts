@@ -13,11 +13,11 @@ export function createDocumentClient(options: BetterAuthDynamoDBOptions): Dynamo
   return DynamoDBDocumentClient.from(client, { marshallOptions: { removeUndefinedValues: true } });
 }
 
-export function normalizeOptions<O extends BetterAuthDynamoDBOptions>(options: O): Required<Pick<BetterAuthDynamoDBOptions, "maxPages" | "unsafeAllowScan" | "maxBulkConcurrency">> & O {
+export function normalizeOptions<O extends BetterAuthDynamoDBOptions>(options: O): Required<Pick<BetterAuthDynamoDBOptions, "maxPages" | "unsafeAllowScan" | "consistentRead" | "maxBulkConcurrency">> & O {
   const uniqueFields = dedupeUniqueFields(options.uniqueFields);
   const pageSize = optionalPositiveSafeIntegerOption("pageSize", options.pageSize);
   const maxBulkConcurrency = positiveSafeIntegerOption("maxBulkConcurrency", options.maxBulkConcurrency, 8);
-  return { ...options, ...(uniqueFields ? { uniqueFields } : {}), ...(pageSize ? { pageSize } : {}), maxPages: positiveSafeIntegerOption("maxPages", options.maxPages, 25), unsafeAllowScan: options.unsafeAllowScan ?? false, maxBulkConcurrency };
+  return { ...options, ...(uniqueFields ? { uniqueFields } : {}), ...(pageSize ? { pageSize } : {}), maxPages: positiveSafeIntegerOption("maxPages", options.maxPages, 25), unsafeAllowScan: options.unsafeAllowScan ?? false, consistentRead: options.consistentRead ?? true, maxBulkConcurrency };
 }
 
 function positiveSafeIntegerOption(name: string, value: number | undefined, defaultValue: number): number {
