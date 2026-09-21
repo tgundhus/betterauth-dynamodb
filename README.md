@@ -134,6 +134,23 @@ A query needs a supported keyed predicate: case-sensitive equality or scalar `IN
 
 ## Concurrency guarantees and limitations
 
+### SCIM and advanced SSO compatibility
+
+With Better Auth's `@better-auth/scim` and `@better-auth/sso` packages at `1.7.5`:
+
+| Feature                     | Status in this adapter                                                                                          |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| SCIM provisioning           | Incompatible. The plugin rejects initialization without callback transaction support.                           |
+| SSO `resolveUser`           | Incompatible. This path requires callback transactions and transaction async context.                           |
+| SSO `guardProviderMutation` | Incompatible. Guarded provider updates and deletes require callback transactions and transaction async context. |
+| Other SSO paths             | Not covered by these specific transaction requirements; this is not a claim of complete SSO compatibility.      |
+
+The adapter's atomic single-record writes do not satisfy these requirements. Setting a capability flag or running a callback's writes as separate DynamoDB transactions would allow partial provisioning and authentication changes. See the [SCIM transaction requirements](https://better-auth.com/docs/plugins/scim#enable-database-transactions) and [SSO user resolution requirements](https://better-auth.com/docs/plugins/sso#resolve-sso-users).
+
+Large SCIM operations cannot be fixed by buffering writes into one native transaction: DynamoDB's 100-item limit includes entity rows, scalar indexes, uniqueness locks, and condition checks. A new SCIM group membership uses eight items in the current format, so 13 new memberships alone need 104 items. The [DynamoDB-only transaction design](./docs/enterprise-transactions.md) describes the separate storage and recovery work required. It is a proposal, not an available adapter feature.
+
+### Current guarantees
+
 - `create` transactionally writes the entity row, scalar equality sidecars, and configured uniqueness locks with conditional non-existence checks.
 - `update`, `updateMany`, `delete`, and `deleteMany` transactionally maintain sidecars and uniqueness locks. After the adapter reads and matches a target, the write uses an optimistic condition on the hidden per-entity revision rather than trying to translate arbitrary Better Auth operators into DynamoDB transaction conditions. This rejects stale ABA-shaped writes even if record contents changed away and back between read and mutation.
 - `consumeOne` transactionally deletes the matched entity, sidecars, and uniqueness locks with the same revision guard. Exactly one concurrent caller can consume a row; normal stale/lost consume races resolve to `null` as Better Auth expects, while non-conditional AWS failures still throw.
