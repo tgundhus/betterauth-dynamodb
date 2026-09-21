@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { UnsupportedQueryError } from "../src/errors.js";
 import type { CleanedWhere } from "../src/types.js";
-import { matchesWhere, planQuery } from "../src/where.js";
+import { inWhere, matchesWhere, planQuery } from "../src/where.js";
 
 const clause = (field: string, operator: CleanedWhere["operator"], value: CleanedWhere["value"], overrides: Partial<CleanedWhere> = {}): CleanedWhere => ({ field, operator, value, connector: "AND", mode: "sensitive", ...overrides });
 
@@ -24,6 +24,23 @@ describe("where planning and matching", () => {
     expect(planQuery([insensitiveIn], true).kind).toBe("byModel");
     expect(planQuery([eqClause("id", "u1"), insensitiveIn]).kind).toBe("byId");
     expect(matchesWhere({ email: "a@example.com" }, [insensitiveIn])).toBe(true);
+  });
+
+  it("uses a safe anchor instead of case-insensitive id IN", () => {
+    const insensitiveIds = clause("id", "in", ["ABC"], { mode: "insensitive" });
+    expect(() => planQuery([insensitiveIds])).toThrow(/case-sensitive/);
+    expect(planQuery([insensitiveIds, eqClause("organizationId", "org")]).kind).toBe("byFieldValue");
+    expect(planQuery([insensitiveIds, clause("role", "in", ["admin"])]).kind).toBe("byFieldValues");
+    expect(matchesWhere({ id: "abc", organizationId: "org" }, [insensitiveIds, eqClause("organizationId", "org")])).toBe(true);
+  });
+
+  it("selects a later sensitive id IN clause for exact-key reads", () => {
+    const insensitiveIds = clause("id", "in", ["ABC"], { mode: "insensitive" });
+    const sensitiveIds = clause("id", "in", ["abc"]);
+    const where = [insensitiveIds, sensitiveIds];
+    expect(planQuery(where).kind).toBe("byIdValues");
+    expect(inWhere(where, "id")).toBe(sensitiveIds);
+    expect(matchesWhere({ id: "abc" }, where)).toBe(true);
   });
 
   it("rejects OR predicates instead of narrowing to one keyed branch", () => {

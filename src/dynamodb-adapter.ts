@@ -1,8 +1,9 @@
 import {
+  BatchGetCommand,
   GetCommand,
   QueryCommand,
-  ScanCommand,
   TransactWriteCommand,
+  type QueryCommandInput,
   type TransactWriteCommandInput,
   type DynamoDBDocumentClient
 } from "@aws-sdk/lib-dynamodb";
@@ -16,6 +17,8 @@ import { eqWhere, firstEquality, inWhere, matchesWhere, planQuery, safeInWhere, 
 
 const MAX_TRANSACT_ITEMS = 100;
 const MAX_IN_VALUES = 1000;
+const MAX_BATCH_GET_ITEMS = 100;
+const MAX_BATCH_GET_STALLED_ATTEMPTS = 8;
 
 export class DynamoDBStore {
   private readonly client: DynamoDBDocumentClient;
@@ -39,7 +42,7 @@ export class DynamoDBStore {
 
   async findMany<T>(model: string, where: CleanedWhere[] = [], limit = 100, offset = 0, sortBy?: { field: string; direction: "asc" | "desc" }, select?: string[]): Promise<T[]> {
     const plan = planQuery(where, this.options.unsafeAllowScan);
-    const rows = await this.loadRows(model, plan);
+    const rows = await this.loadRows(model, plan, sortBy ? undefined : readWindowSize(limit, offset));
     return selectWindow(rows.filter((row) => matchesWhere(row, where)), limit, offset, sortBy, this.options.ttl, select) as T[];
   }
 
@@ -127,30 +130,47 @@ export class DynamoDBStore {
     return rows.length;
   }
 
-  private async loadRows(model: string, plan: QueryPlan): Promise<StoredItem[]> {
+  private async loadRows(model: string, plan: QueryPlan, take?: number): Promise<StoredItem[]> {
     if (plan.kind === "byId") return this.loadById(model, plan.where);
     if (plan.kind === "byIdValues") return this.loadByIds(model, plan.where);
-    if (plan.kind === "byFieldValue") return this.loadByField(model, plan.where);
+    if (plan.kind === "byFieldValue") return this.loadByField(model, plan.where, take);
     if (plan.kind === "byFieldValues") return this.loadByFields(model, plan.where);
-    return this.scanModel(model);
+    return this.queryModel(model, plan.where, take);
   }
 
   private async loadById(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
     const id = eqWhere(where, "id")?.value;
-    const result = await this.client.send(new GetCommand({ TableName: this.options.tableName, Key: { pk: modelPk(model), sk: entitySk(String(id)) }, ConsistentRead: true }));
+    const result = await this.client.send(new GetCommand({ TableName: this.options.tableName, Key: { pk: modelPk(model), sk: entitySk(String(id)) }, ConsistentRead: this.options.consistentRead }));
     return visibleRows(result.Item ? [result.Item as StoredItem] : [], this.options.ttl);
   }
 
-  private async loadByField(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
+  private async loadByField(model: string, where: CleanedWhere[], take?: number): Promise<StoredItem[]> {
     const clause = firstEquality(where);
     if (!clause) return [];
+    if (take !== undefined) {
+      const command = sidecarQuery(this.options.tableName, model, clause, this.options.consistentRead, this.options.pageSize);
+      return this.queryWindow<SidecarItem>(command, where, take, (items) => this.loadOwners(items, clause));
+    }
     const sidecars = await this.queryAllSidecars(model, clause);
     return this.loadOwners(sidecars, clause);
   }
 
-  private async scanModel(model: string): Promise<StoredItem[]> {
-    const items = await this.scanAllModel(model);
+  private async queryModel(model: string, where: CleanedWhere[], take?: number): Promise<StoredItem[]> {
+    if (take !== undefined) {
+      const command = modelQuery(this.options.tableName, model, this.options.consistentRead, this.options.pageSize);
+      return this.queryWindow<StoredItem>(command, where, take, async (items) => items);
+    }
+    const items = await this.queryAllModel(model);
     return visibleRows(items, this.options.ttl);
+  }
+
+  private async queryWindow<T>(command: QueryCommandInput, where: CleanedWhere[], take: number, hydrate: (items: T[]) => Promise<StoredItem[]>): Promise<StoredItem[]> {
+    return drainPages<StoredItem>(async (key) => {
+      const page = await this.client.send(new QueryCommand({ ...command, ExclusiveStartKey: key }));
+      const owners = await hydrate((page.Items ?? []) as T[]);
+      const rows = visibleRows(owners, this.options.ttl).filter((row) => matchesWhere(row, where));
+      return { ...pageOf<StoredItem>(page), Items: rows };
+    }, this.options.maxPages, undefined, (rows) => visibleRows(rows, this.options.ttl).length >= take);
   }
 
   async transactCreate(items: { model: string; data: Record<string, unknown> }[]): Promise<void> {
@@ -199,26 +219,31 @@ export class DynamoDBStore {
   }
 
   private async queryAllSidecars(model: string, clause: CleanedWhere, budget?: { remaining: number }): Promise<SidecarItem[]> {
-    const command = sidecarQuery(this.options.tableName, model, clause, this.options.pageSize);
+    const command = sidecarQuery(this.options.tableName, model, clause, this.options.consistentRead, this.options.pageSize);
     return drainPages<SidecarItem>(async (key) => pageOf<SidecarItem>(await this.client.send(new QueryCommand({ ...command, ExclusiveStartKey: key }))), this.options.maxPages, budget);
   }
 
-  private async scanAllModel(model: string): Promise<StoredItem[]> {
-    const command = modelScan(this.options.tableName, model, this.options.pageSize);
-    return drainPages<StoredItem>(async (key) => pageOf<StoredItem>(await this.client.send(new ScanCommand({ ...command, ExclusiveStartKey: key }))), this.options.maxPages);
+  private async queryAllModel(model: string): Promise<StoredItem[]> {
+    const command = modelQuery(this.options.tableName, model, this.options.consistentRead, this.options.pageSize);
+    return drainPages<StoredItem>(async (key) => pageOf<StoredItem>(await this.client.send(new QueryCommand({ ...command, ExclusiveStartKey: key }))), this.options.maxPages);
   }
 
   private async loadOwners(sidecars: SidecarItem[], clause: CleanedWhere): Promise<StoredItem[]> {
-    const rows = await mapBounded(sidecars, this.options.maxBulkConcurrency, (item) => this.loadOwner(item));
-    return rows.filter((row): row is StoredItem => row !== null && matchesWhere(row, [clause]));
+    const keys = sidecars.flatMap(ownerKeyOf);
+    const rows = await this.batchGetRows(keys);
+    return rows.filter((row) => matchesWhere(row, [clause]));
   }
 
-  private async loadOwner(sidecar: SidecarItem): Promise<StoredItem | null> {
-    const ownerPk = ownerKeyPart(sidecar.ownerPk, sidecar.entity.ownerPk);
-    const ownerSk = ownerKeyPart(sidecar.ownerSk, sidecar.entity.ownerSk);
-    if (typeof ownerPk !== "string" || typeof ownerSk !== "string") return null;
-    const result = await this.client.send(new GetCommand({ TableName: this.options.tableName, Key: { pk: ownerPk, sk: ownerSk }, ConsistentRead: true }));
-    return visibleOwner((result.Item as StoredItem | undefined) ?? null, this.options.ttl);
+  private async batchGetRows(keys: { pk: string; sk: string }[]): Promise<StoredItem[]> {
+    const uniqueKeys = [...new Map(keys.map((key) => [keyString(key), key])).values()];
+    const batches = chunk(uniqueKeys, MAX_BATCH_GET_ITEMS);
+    const rows = await mapBounded(batches, this.options.maxBulkConcurrency, (batch) => this.batchGet(batch));
+    const rowsByKey = new Map(rows.flat().map((row) => [keyString(row), row]));
+    return visibleRows(uniqueKeys.flatMap((key) => rowsByKey.get(keyString(key)) ?? []), this.options.ttl);
+  }
+
+  private async batchGet(keys: { pk: string; sk: string }[]): Promise<StoredItem[]> {
+    return batchGetAttempts(this.client, this.options.tableName, keys, this.options.consistentRead);
   }
 
   private sidecars(model: string, data: Record<string, unknown>): SidecarItem[] {
@@ -238,9 +263,7 @@ export class DynamoDBStore {
     if (!clause) return [];
     const ids = [...new Set(scalarValues(clause).map(String))];
     assertInValueCount(ids.length);
-    const rows: StoredItem[][] = [];
-    for (const id of ids) rows.push(await this.loadById(model, [{ field: "id", operator: "eq", value: id, mode: "sensitive" }]));
-    return rows.flat();
+    return this.batchGetRows(ids.map((id) => ({ pk: modelPk(model), sk: entitySk(id) })));
   }
 
   private async loadByFields(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
@@ -248,10 +271,9 @@ export class DynamoDBStore {
     if (!clause) return [];
     const values = [...new Map(scalarValues(clause).map((value) => [JSON.stringify([typeof value, value instanceof Date ? value.toISOString() : value]), value])).values()];
     assertInValueCount(values.length);
-    const sidecars: SidecarItem[] = [];
     const budget = { remaining: this.options.maxPages };
-    for (const value of values) sidecars.push(...await this.queryAllSidecars(model, { ...clause, operator: "eq", value } as CleanedWhere, budget));
-    const unique = new Map(sidecars.map((item) => [sidecarKey(item), item]));
+    const pages = await mapBounded(values, this.options.maxBulkConcurrency, (value) => this.queryAllSidecars(model, { ...clause, operator: "eq", value } as CleanedWhere, budget));
+    const unique = new Map(pages.flat().map((item) => [sidecarKey(item), item]));
     return this.loadOwners([...unique.values()], clause);
   }
 }
@@ -260,9 +282,19 @@ function keyOf(item: Pick<StoredItem, "pk" | "sk">): { pk: string; sk: string } 
   return { pk: item.pk, sk: item.sk };
 }
 
+function readWindowSize(limit: number, offset: number): number | undefined {
+  if (!Number.isSafeInteger(limit) || limit <= 0) return undefined;
+  if (!Number.isSafeInteger(offset) || offset < 0) return undefined;
+  return Number.isSafeInteger(offset + limit) ? offset + limit : undefined;
+}
+
 function selectWindow(rows: StoredItem[], limit: number, offset: number, sortBy?: { field: string; direction: "asc" | "desc" }, ttl?: false | TtlOptions, select?: string[]): Record<string, unknown>[] {
   const sorted = sortBy ? [...rows].sort((a, b) => compareSort(a, b, sortBy)) : rows;
-  return sorted.slice(offset, offset + limit).map((row) => projectRecord(fromStoredItem<Record<string, unknown>>(row, ttl) ?? {}, select));
+  const records = sorted.flatMap((row) => {
+    const record = fromStoredItem<Record<string, unknown>>(row, ttl);
+    return record ? [record] : [];
+  });
+  return records.slice(offset, offset + limit).map((row) => projectRecord(row, select));
 }
 
 function projectRecord(row: Record<string, unknown>, select?: string[]): Record<string, unknown> {
@@ -380,6 +412,7 @@ function isAddableNumber(value: unknown): boolean {
 function optionalMetadataSetParts(newItem: StoredItem, names: Record<string, string>, values: Record<string, unknown>, ttl?: false | TtlOptions): string[] {
   const parts: string[] = [];
   if (newItem.createdAtSort !== undefined) parts.push(assignMetadata("#createdAtSort", "createdAtSort", ":createdAtSort", newItem.createdAtSort, names, values));
+  if (!ttl) return parts;
   const ttlName = ttlAttribute(ttl);
   if (newItem[ttlName] !== undefined) parts.push(assignMetadata("#ttl", ttlName, ":ttl", newItem[ttlName], names, values));
   return parts;
@@ -388,6 +421,7 @@ function optionalMetadataSetParts(newItem: StoredItem, names: Record<string, str
 function optionalMetadataRemoveParts(oldItem: StoredItem, newItem: StoredItem, names: Record<string, string>, ttl?: false | TtlOptions): string[] {
   const parts: string[] = [];
   if (oldItem.createdAtSort !== undefined && newItem.createdAtSort === undefined) parts.push(removeMetadata("#createdAtSort", "createdAtSort", names));
+  if (!ttl) return parts;
   const ttlName = ttlAttribute(ttl);
   if (oldItem[ttlName] !== undefined && newItem[ttlName] === undefined) parts.push(removeMetadata("#ttl", ttlName, names));
   return parts;
@@ -498,19 +532,20 @@ function conflictError(operation: string, cause: unknown): DynamoDBConflictError
   return new DynamoDBConflictError(`Better Auth DynamoDB ${operation} conflicted with a concurrent write after the target row was read. Retry the operation.`, { cause });
 }
 
-function drainPages<T>(load: (key?: Record<string, unknown>) => Promise<{ Items?: T[]; LastEvaluatedKey?: Record<string, unknown> }>, maxPages: number, budget?: { remaining: number }): Promise<T[]> {
-  return drainPagesInner(load, maxPages, undefined, [], 0, budget);
+function drainPages<T>(load: (key?: Record<string, unknown>) => Promise<{ Items?: T[]; LastEvaluatedKey?: Record<string, unknown> }>, maxPages: number, budget?: { remaining: number }, complete?: (items: T[]) => boolean): Promise<T[]> {
+  return drainPagesInner(load, maxPages, undefined, [], 0, budget, complete);
 }
 
 function pageOf<T>(result: { Items?: Record<string, unknown>[] | undefined; LastEvaluatedKey?: Record<string, unknown> | undefined }): { Items?: T[]; LastEvaluatedKey?: Record<string, unknown> } {
   return { ...(result.Items ? { Items: result.Items as T[] } : {}), ...(result.LastEvaluatedKey ? { LastEvaluatedKey: result.LastEvaluatedKey } : {}) };
 }
 
-async function drainPagesInner<T>(load: (key?: Record<string, unknown>) => Promise<{ Items?: T[]; LastEvaluatedKey?: Record<string, unknown> }>, maxPages: number, key: Record<string, unknown> | undefined, items: T[], page: number, budget?: { remaining: number }): Promise<T[]> {
+async function drainPagesInner<T>(load: (key?: Record<string, unknown>) => Promise<{ Items?: T[]; LastEvaluatedKey?: Record<string, unknown> }>, maxPages: number, key: Record<string, unknown> | undefined, items: T[], page: number, budget: { remaining: number } | undefined, complete?: (items: T[]) => boolean): Promise<T[]> {
   consumePageBudget(page, maxPages, budget);
   const result = await load(key);
-  const next = [...items, ...(result.Items ?? [])];
-  return result.LastEvaluatedKey ? drainPagesInner(load, maxPages, result.LastEvaluatedKey, next, page + 1, budget) : next;
+  for (const item of result.Items ?? []) items.push(item);
+  if (complete?.(items)) return items;
+  return result.LastEvaluatedKey ? drainPagesInner(load, maxPages, result.LastEvaluatedKey, items, page + 1, budget, complete) : items;
 }
 
 function consumePageBudget(page: number, maxPages: number, budget?: { remaining: number }): void {
@@ -520,12 +555,12 @@ function consumePageBudget(page: number, maxPages: number, budget?: { remaining:
   budget.remaining -= 1;
 }
 
-function sidecarQuery(tableName: string, model: string, clause: CleanedWhere, pageSize?: number) {
-  return withPageSize({ TableName: tableName, ConsistentRead: true, KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :sk)", ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" }, ExpressionAttributeValues: { ":pk": indexPk(model, clause.field, clause.value), ":sk": "OWNER#" } }, pageSize);
+function sidecarQuery(tableName: string, model: string, clause: CleanedWhere, consistentRead: boolean, pageSize?: number) {
+  return withPageSize({ TableName: tableName, ConsistentRead: consistentRead, KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :sk)", ExpressionAttributeNames: { "#pk": "pk", "#sk": "sk" }, ExpressionAttributeValues: { ":pk": indexPk(model, clause.field, clause.value), ":sk": "OWNER#" } }, pageSize);
 }
 
-function modelScan(tableName: string, model: string, pageSize?: number) {
-  return withPageSize({ TableName: tableName, ConsistentRead: true, FilterExpression: "#model = :model", ExpressionAttributeNames: { "#model": "model" }, ExpressionAttributeValues: { ":model": model } }, pageSize);
+function modelQuery(tableName: string, model: string, consistentRead: boolean, pageSize?: number) {
+  return withPageSize({ TableName: tableName, ConsistentRead: consistentRead, KeyConditionExpression: "#pk = :pk", ExpressionAttributeNames: { "#pk": "pk" }, ExpressionAttributeValues: { ":pk": modelPk(model) } }, pageSize);
 }
 
 function withPageSize<T extends Record<string, unknown>>(command: T, pageSize?: number): T & { Limit?: number } {
@@ -540,13 +575,45 @@ function visibleRows(rows: StoredItem[], ttl?: false | TtlOptions): StoredItem[]
   return rows.filter((row) => !isLogicallyExpired(row, ttl));
 }
 
-function visibleOwner(owner: StoredItem | null, ttl?: false | TtlOptions): StoredItem | null {
-  if (!owner) return null;
-  return isLogicallyExpired(owner, ttl) ? null : owner;
-}
-
 function ownerKeyPart(primary: unknown, fallback: unknown): unknown {
   return typeof primary === "string" ? primary : fallback;
+}
+
+function ownerKeyOf(sidecar: SidecarItem): { pk: string; sk: string }[] {
+  const pk = ownerKeyPart(sidecar.ownerPk, sidecar.entity.ownerPk);
+  const sk = ownerKeyPart(sidecar.ownerSk, sidecar.entity.ownerSk);
+  return typeof pk === "string" && typeof sk === "string" ? [{ pk, sk }] : [];
+}
+
+function keyString(key: { pk: string; sk: string }): string {
+  return `${key.pk}\u0000${key.sk}`;
+}
+
+function chunk<T>(items: T[], size: number): T[][] {
+  return Array.from({ length: Math.ceil(items.length / size) }, (_, index) => items.slice(index * size, (index + 1) * size));
+}
+
+async function batchGetAttempts(client: DynamoDBDocumentClient, tableName: string, keys: { pk: string; sk: string }[], consistentRead: boolean, stalledAttempts = 0, rows: StoredItem[] = []): Promise<StoredItem[]> {
+  if (keys.length === 0) return rows;
+  const result = await client.send(new BatchGetCommand({ RequestItems: { [tableName]: { Keys: keys, ConsistentRead: consistentRead } } }));
+  const nextRows = [...rows, ...((result.Responses?.[tableName] ?? []) as StoredItem[])];
+  const unprocessed = (result.UnprocessedKeys?.[tableName]?.Keys ?? []) as { pk: string; sk: string }[];
+  if (unprocessed.length === 0) return nextRows;
+  const nextStalledAttempts = batchGetStalledAttempts(keys.length, unprocessed.length, stalledAttempts);
+  await batchGetBackoff(Math.max(1, nextStalledAttempts));
+  return batchGetAttempts(client, tableName, unprocessed, consistentRead, nextStalledAttempts, nextRows);
+}
+
+function batchGetStalledAttempts(requested: number, unprocessed: number, previous: number): number {
+  // Size-limited responses and missing items can make progress without completing a batch.
+  const attempts = unprocessed < requested ? 0 : previous + 1;
+  if (attempts >= MAX_BATCH_GET_STALLED_ATTEMPTS) throw new DynamoDBAdapterError(`Better Auth DynamoDB BatchGet still had ${unprocessed} unprocessed keys after ${attempts} consecutive attempts without progress.`);
+  return attempts;
+}
+
+function batchGetBackoff(attempt: number): Promise<void> {
+  const maximum = Math.min(2 ** attempt * 10, 1000);
+  return new Promise((resolve) => setTimeout(resolve, Math.random() * maximum));
 }
 
 /** Runs independent records with bounded parallelism; failures stop new claims and all started work settles before rejection. */

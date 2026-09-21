@@ -31,7 +31,7 @@ export function firstEquality(where: CleanedWhere[] = []): CleanedWhere | undefi
 }
 
 export function inWhere(where: CleanedWhere[], field: string): CleanedWhere | undefined {
-  return where.find((w) => w.field === field && w.operator === "in" && isScalarArray(w.value));
+  return where.find((w) => w.field === field && isSafeIn(w));
 }
 
 export function scalarValues(clause: CleanedWhere): (string | number | boolean | Date | null)[] {

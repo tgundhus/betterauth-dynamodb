@@ -9,12 +9,14 @@ export interface BetterAuthDynamoDBOptions {
   dynamoDBClientConfig?: DynamoDBClientConfig;
   ttl?: false | TtlOptions;
   unsafeAllowScan?: boolean;
+  /** Request strongly consistent reads. Defaults to true. */
+  consistentRead?: boolean;
   maxPages?: number;
   pageSize?: number;
   uniqueFields?: Record<string, string[]>;
   /** Opt in to Better Auth schema `indexes` unique constraints. */
   enforceSchemaUniqueIndexes?: boolean;
-  /** Maximum number of independent bulk transactions in flight. */
+  /** Maximum concurrent bulk transactions, scalar IN queries, or BatchGet chunks. */
   maxBulkConcurrency?: number;
 }
 
