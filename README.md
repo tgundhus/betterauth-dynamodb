@@ -1,26 +1,45 @@
-# @bjorntech/betterauth-dynamodb
+# Better Auth DynamoDB
 
-Production-oriented DynamoDB adapter targeting Better Auth `^1.6.25` via the official `createAdapterFactory` API.
+A DynamoDB adapter for Better Auth, with transactional uniqueness, guarded concurrent writes, and explicit control over read costs.
 
-## Status
+This project is an independently maintained continuation of [BjornTech's Better Auth DynamoDB adapter](https://github.com/bjorntech/betterauth-dynamodb), based on their `v1.1.0` release. Development of this continuation takes place in [tgundhus/betterauth-dynamodb](https://github.com/tgundhus/betterauth-dynamodb).
 
-The upstream package is published on npm as `@bjorntech/betterauth-dynamodb`. This fork's 1.2.0 changes build on upstream `v1.1.0`; the npm installation commands below refer to the upstream package, so build this checkout to use the fork until it is published separately. The repository has unit coverage for command construction, adapter semantics, query planning, and Better Auth factory wiring, plus explicit Docker-backed DynamoDB Local integration suites (including a separate Better Auth adapter conformance test file).
+BjornTech built the original adapter and its correctness guarantees. Our focus is to build on that work with practical performance improvements, stability fixes, and thorough tests while keeping the public API and existing data format compatible.
 
-Storage compatibility note: the current storage format uses transactionally maintained scalar equality sidecar rows in the base table, delimiter-safe length-prefixed key components, SHA-256 hashes for sidecar/unique-lock values, and hidden internal revision metadata for ABA-safe mutations. Experimental tables using older generic `gsi1`/`idx_<field>_*`, pre-length-prefixed, pre-hash, or pre-revision formats should be recreated or migrated before using this version; pre-revision rows can still be read but fail clearly if mutated.
+## What this continuation adds
 
-Upgrade note: 1.1.0 to 1.2.0 requires no storage migration. Before deploying, add `dynamodb:BatchGetItem` to the application role for the adapter table; existing `GetItem` permission does not cover batch reads. Opt-in model fallbacks now require `Query` instead of `Scan`. The release changes read commands and adds the backwards-compatible `consistentRead` option while preserving the existing entity, sidecar, unique-lock, revision, and TTL formats. The earlier 1.0.1 to 1.1.0 upgrade requires no migration when `enforceSchemaUniqueIndexes` remains at its default `false`; for existing records, opting into schema unique constraints still requires a stopped-write audit, duplicate repair, and application-owned lock backfill before all compatible writers restart with enforcement enabled. New empty affected models need no backfill. No migration utility is supplied.
+Version `1.2.0` focuses on reducing unnecessary DynamoDB requests and handling read edge cases reliably:
+
+- Model-partition queries replace table scans for explicitly enabled fallback reads.
+- Batched reads load records for `id IN` queries and indexed lookups, with stable ordering and retries for unprocessed keys.
+- Bounded concurrency speeds up independent scalar-field `IN` queries.
+- Unsorted, limited equality and model queries stop reading pages once enough live, matching records are available.
+- Strongly consistent reads remain the default, with an explicit option for eventual consistency.
+- Query planning and TTL fixes cover case-insensitive ID filters, ordinary fields named `ttl`, and records that expire during pagination.
+
+The adapter uses Better Auth's official `createAdapterFactory` API, supports Better Auth `^1.6.25`, and is tested against `1.7.5`. Unit tests, DynamoDB Local integration tests, and Better Auth's adapter conformance suites cover the implementation. See the [changelog](./CHANGELOG.md) for release details.
 
 ## Installation
 
-Install the adapter and its Better Auth peer dependency with your package manager:
+This continuation is currently distributed from this repository. The package still uses the name `@bjorntech/betterauth-dynamodb` for compatibility, so installing that name from npm retrieves BjornTech's published package rather than this continuation.
+
+To use this version, build and package the source with Bun and npm installed:
 
 ```sh
-npm install @bjorntech/betterauth-dynamodb better-auth
-bun add @bjorntech/betterauth-dynamodb better-auth
-pnpm add @bjorntech/betterauth-dynamodb better-auth
+git clone https://github.com/tgundhus/betterauth-dynamodb.git
+cd betterauth-dynamodb
+bun install --frozen-lockfile
+bun run build
+npm pack --ignore-scripts
 ```
 
-AWS SDK DynamoDB packages are runtime dependencies of this adapter.
+This produces `bjorntech-betterauth-dynamodb-1.2.0.tgz`. From your application directory, install the generated archive and Better Auth, replacing the archive path with its actual location:
+
+```sh
+npm install /path/to/bjorntech-betterauth-dynamodb-1.2.0.tgz better-auth
+```
+
+The import path remains `@bjorntech/betterauth-dynamodb`. AWS SDK DynamoDB packages are runtime dependencies of the adapter. For reproducible deployments, build from a pinned commit and retain the generated archive.
 
 ## Basic usage
 
@@ -33,17 +52,17 @@ import { betterAuth } from "better-auth";
 import { dynamoDBAdapter } from "@bjorntech/betterauth-dynamodb";
 
 const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
-  marshallOptions: { removeUndefinedValues: true }
+  marshallOptions: { removeUndefinedValues: true },
 });
 
 export const auth = betterAuth({
   database: dynamoDBAdapter({
     tableName: "better-auth",
     client: dynamo,
-    ttl: { fields: { session: "expiresAt", verification: "expiresAt" } }
+    ttl: { fields: { session: "expiresAt", verification: "expiresAt" } },
   }),
   verification: { disableCleanup: true },
-  emailAndPassword: { enabled: true }
+  emailAndPassword: { enabled: true },
 });
 ```
 
@@ -52,6 +71,18 @@ When the `verification` model uses adapter-managed TTL, disable Better Auth's ve
 For local development you may pass `region`, `endpoint`, and/or `dynamoDBClientConfig` instead of `client`. Production deployments should usually inject the client.
 
 See [examples](./examples/) for standalone deployment examples that use local path dependencies.
+
+## Upgrading from BjornTech 1.1.0
+
+Version `1.2.0` requires no storage migration from upstream `1.1.0`. Entity keys, scalar indexes, uniqueness locks, revision metadata, and TTL formats stay compatible.
+
+Before deploying, add `dynamodb:BatchGetItem` to the application role for the adapter table. Existing `GetItem` permission does not cover batch reads. Opt-in model fallbacks use `Query` instead of `Scan`, so make sure the role permits `Query` too.
+
+Read consistency remains strong by default. Set `consistentRead: false` only when your application can accept delayed visibility of writes.
+
+For the earlier `1.0.1` to `1.1.0` upgrade, no migration is needed while `enforceSchemaUniqueIndexes` stays at its default `false`. Enabling schema unique constraints on existing records requires stopping writes, auditing and repairing duplicates, and backfilling locks before compatible writers restart. New empty models need no backfill. No migration utility is supplied.
+
+Experimental tables using older generic `gsi1`/`idx_<field>_*`, pre-length-prefixed, pre-hash, or pre-revision formats need to be recreated or migrated. Pre-revision rows remain readable but fail clearly if mutated.
 
 ## API
 
@@ -75,7 +106,7 @@ import { dynamoDBAdapter } from "@bjorntech/betterauth-dynamodb";
 
 The schema-index option consumes Better Auth's actual table-level `indexes` array (`DBTableIndex[]`) and only acts on entries with `unique: true`; it does not add an alternative schema-definition option. On a new empty table it can be enabled directly. For a populated table, use a maintenance window with writes stopped: audit duplicates, repair them, and complete an application-owned lock backfill before restarting all writers with compatible code and enforcement enabled. This package provides no migration or backfill utility; do not enable it on unbackfilled rows or allow old/incompatible writers to continue. The `UNIQUE2` namespace is stable only while the index name (explicit or derived), ordered field list, and model/field mapping remain unchanged; changing any of those requires backfilling the new namespace, and pre-existing records do not acquire locks automatically. Rollback requires an explicit plan for versioned locks and writers that may have observed the constraint; disabling the option alone does not undo backfill or repair duplicates.
 
-The package also exports `BetterAuthDynamoDBOptions`, `TtlOptions`, `DynamoDBAdapterError`, and `UnsupportedQueryError`.
+The package also exports `BetterAuthDynamoDBOptions`, `TtlOptions`, `DynamoDBAdapterError`, `DynamoDBConflictError`, and `UnsupportedQueryError`.
 
 ## Deployment notes
 
@@ -85,7 +116,7 @@ For email OTP sign-in or other flows where verification rows expire through Dyna
 
 Better Auth database-backed rate limiting has the same DynamoDB trade-off. The rate-limit `key` field is schema-unique and works well for exact-key increments, but Better Auth cleanup can require range-only predicates such as old `lastRequest` values. Leave `unsafeAllowScan` disabled for production unless you have a tightly bounded table and have accepted the cost/consistency profile. Prefer Better Auth's non-database/in-memory limiter for single-instance local development, an edge/API-gateway/WAF limiter, or an application-owned DynamoDB rate-limit table with access patterns designed for your cleanup needs.
 
-If a needed access pattern has no id or scalar equality predicate, the adapter throws unless `unsafeAllowScan: true` is set. `OR` predicates and `mode: "insensitive"` equality also cannot use a narrow keyed access path safely: `OR` can match rows outside one narrowed branch, and DynamoDB entity/sidecar keys are case-sensitive. Those shapes require `unsafeAllowScan: true` so the adapter can explicitly drain the bounded model partition with a keyed `Query` and evaluate the full expression in memory. A future optional native-GSI optimization may be added with descriptive API names, but there is no generic GSI option today.
+A query needs a supported keyed predicate: case-sensitive equality or scalar `IN` on an ID or indexed field. Without one, the adapter throws unless `unsafeAllowScan: true` is set. `OR` predicates always require that opt-in because they can match rows outside a single keyed branch. Case-insensitive equality and `IN` can use a separate safe keyed predicate as an anchor, then run as residual filters; without that anchor, they also require the fallback opt-in. The fallback reads the model partition with `Query` and evaluates the expression in memory. No native GSI is required or configured.
 
 ## Table and key model
 
@@ -110,7 +141,7 @@ If a needed access pattern has no id or scalar equality predicate, the adapter t
 - Transactional writes include a fresh AWS `ClientRequestToken` per command construction. This gives AWS SDK/internal network retries of that single send a stable token, but it is not cross-invocation or application-level idempotency.
 - DynamoDB `TransactWriteItems` is limited to 100 actions. The adapter de-duplicates configured unique-field lists, validates that a transaction contains at most one action per item key, rejects serialized transaction requests over approximately 4 MB, and fails early with an actionable error if entity + sidecars + unique locks for a mutation would exceed either limit.
 - Better Auth callback transactions are unsupported because DynamoDB has no interactive transaction API; the adapter reports `transaction: false`. DynamoDB `TransactWriteItems` is single-shot and is used internally for single-record atomic operations.
-- Queries without `id` equality or scalar equality require `unsafeAllowScan: true`; this avoids accidental model-partition draining. Queries containing `OR` predicates, or equality clauses with `mode: "insensitive"` and no other safe keyed equality, also require the explicit fallback opt-in. `updateMany`, `deleteMany`, and `count` obey the same guard.
+- Queries without a supported keyed equality or scalar `IN` predicate require `unsafeAllowScan: true`; this avoids accidental model-partition draining. Queries containing `OR` predicates, or case-insensitive equality/`IN` without a separate safe keyed predicate, also require the explicit fallback opt-in. `updateMany`, `deleteMany`, and `count` obey the same guard.
 - Base entity gets, sidecar/model queries, and owner batch gets request `ConsistentRead: true` by default. Setting `consistentRead: false` lowers read cost but may briefly miss a newly written entity or sidecar, or observe an owner version that does not match its sidecar; owner predicates are still verified, so inconsistent pairs are omitted rather than returned incorrectly. Use the default for authentication-critical read-after-write paths. DynamoDB does not provide a whole-operation snapshot even with strong reads, so paginated queries can observe changes between pages.
 - Scalar equality queries use paginated base-table `Query` calls on the sidecar partition, then retrieve owner entity rows in `BatchGet` requests of at most 100 keys using the configured consistency and apply residual `where`, sorting, offset, limit, and count in memory. Unprocessed batch keys are retried with jittered exponential backoff. The adapter fails after eight consecutive responses make no progress; size-limited responses that reduce the pending key set reset that budget. Explicit unsafe fallbacks query only the relevant model partition. For unsorted `findOne`/`findMany` equality and model queries, each page is checked for logical TTL and all residual predicates before counting toward offset plus limit; pagination stops once that window is complete. Sorted reads, counts, mutation target reads, and `IN` reads still load complete candidate sets. Keep high-cardinality equality partitions and fallback-enabled workloads bounded, and tune `maxPages` for your data shape; if the page cap is reached while more rows are needed, the adapter throws instead of returning a partial result. `pageSize` can force smaller Query pages when you intentionally want more, smaller requests.
 - Scalar `IN` predicates on `id` use `BatchGet` requests of at most 100 keys with the configured consistency. Scalar-field `IN` uses one sidecar `Query` per distinct candidate value with concurrency bounded by `maxBulkConcurrency`, after which owner rows are batch-loaded. Empty lists are no-ops; duplicate values are removed; more than 1,000 distinct values are rejected before reads. Concurrent sidecar queries share one global `maxPages` budget, and exceeding it fails the complete operation rather than returning partial results. Residual filters run before global sorting, offset, and limit windowing. Case-insensitive `IN` cannot use exact-case indexes as a complete access path: it requires an independent safe equality anchor or explicit `unsafeAllowScan: true`; with an anchor it is evaluated as a residual predicate. Case-insensitive `IN`/`not_in` comparisons normalize array members.
@@ -150,10 +181,10 @@ The verification command fails if any implementation function has CRAP `> 6`. Do
 - `bun run verify`
 - `bun run verify:integration`
 
-## Contributing
+## Contributing to this continuation
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md). Contributions should preserve atomic correctness, avoid hidden scans, maintain injected-client compatibility, and keep the CRAP <= 6 gate passing.
+Open pull requests against [this repository](https://github.com/tgundhus/betterauth-dynamodb/pulls). We favor small, tested improvements that preserve atomic correctness, avoid hidden scans, and keep client injection and stored data compatible. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the workflow and quality gates.
 
 ## License
 
-MIT © 2026 BjornTech AB. See [LICENSE](./LICENSE).
+Released under the [MIT license](./LICENSE). The original adapter is copyright © 2026 BjornTech AB. This continuation retains the original license and attribution.
