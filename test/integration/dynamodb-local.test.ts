@@ -216,7 +216,19 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(adapter.findOne({ model: "plugin", where: [eq("id", "active")] })).resolves.toMatchObject({ id: "active", ttl: 1, expiresAt: "2030-01-01T00:00:00.000Z" });
   });
 
-  it("uses real DynamoDB Query and Scan pagination with small page sizes", async () => {
+  it("increments and sets ordinary ttl fields when TTL handling is disabled", async () => {
+    for (const ttl of [undefined, false] as const) {
+      const adapter = adapterFor({ client: docClient, ...(ttl === false ? { ttl } : {}) });
+      const id = ttl === false ? "ttl-disabled" : "ttl-omitted";
+      await create(adapter, "plugin", { id, externalId: id, kind: "counter", ttl: 2 });
+
+      await expect(adapter.incrementOne({ model: "plugin", where: [eq("id", id)], increment: { ttl: 1 } })).resolves.toMatchObject({ id, ttl: 3 });
+      await expect(adapter.incrementOne({ model: "plugin", where: [eq("id", id)], increment: {}, set: { ttl: 4 } })).resolves.toMatchObject({ id, ttl: 4 });
+      await expect(adapter.findOne({ model: "plugin", where: [eq("ttl", 4), eq("externalId", id)] })).resolves.toMatchObject({ id, ttl: 4 });
+    }
+  });
+
+  it("uses real DynamoDB sidecar and model Query pagination with small page sizes", async () => {
     const adapter = adapterFor({ client: docClient, unsafeAllowScan: true, pageSize: 1, maxPages: 30 });
     await create(adapter, "user", { id: "u1", name: "C", org: "o1", email: "c@example.com" });
     await create(adapter, "user", { id: "u2", name: "A", org: "o1", email: "a@example.com" });
@@ -228,6 +240,38 @@ describe("DynamoDB Local adapter integration", () => {
       expect.objectContaining({ id: "u1" })
     ]);
     await expect(adapter.count({ model: "user", where: [contains("email", "@example.com")] })).resolves.toBe(3);
+  });
+
+  it("stops complete unsorted read windows before the page cap while preserving full-read guards", async () => {
+    const adapter = adapterFor({ client: docClient, unsafeAllowScan: true, pageSize: 1, maxPages: 1 });
+    await create(adapter, "user", { id: "u1", name: "First", org: "o1", email: "first@example.com" });
+    await create(adapter, "user", { id: "u2", name: "Second", org: "o1", email: "second@example.com" });
+
+    await expect(adapter.findOne({ model: "user", where: [eq("org", "o1")] })).resolves.toMatchObject({ id: "u1" });
+    await expect(adapter.findMany({ model: "user", where: [eq("org", "o1")], limit: 1 })).resolves.toEqual([expect.objectContaining({ id: "u1" })]);
+    await expect(adapter.findMany({ model: "user", where: [], limit: 1 })).resolves.toEqual([expect.objectContaining({ id: "u1" })]);
+    await expect(adapter.count({ model: "user", where: [eq("org", "o1")] })).rejects.toThrow(/maxPages/);
+    await expect(adapter.count({ model: "user", where: [] })).rejects.toThrow(/maxPages/);
+    await expect(adapter.findMany({ model: "user", where: [eq("org", "o1")], limit: 1, sortBy: { field: "name", direction: "desc" } })).rejects.toThrow(/maxPages/);
+  });
+
+  it("fills limited windows after expired, missing, and residual-filtered owners", async () => {
+    const options = { client: docClient, pageSize: 1, ttl: { fields: { plugin: "expiresAt" } } };
+    const adapter = adapterFor({ ...options, maxPages: 5 });
+    for (let index = 0; index < 6; index += 1) {
+      await create(adapter, "plugin", {
+        id: `p${index}`, externalId: `ext-${index}`, kind: "window", name: index === 2 ? "skip" : "keep",
+        expiresAt: index === 0 ? "2000-01-01T00:00:00.000Z" : "2030-01-01T00:00:00.000Z"
+      });
+    }
+    // Leave a stale sidecar to prove it does not fill the requested result window.
+    await docClient.send(new DeleteCommand({ TableName: tableName, Key: { pk: modelPk("plugin"), sk: entitySk("p1") } }));
+    const where = [eq("kind", "window"), eq("name", "keep")];
+
+    await expect(adapter.findOne({ model: "plugin", where })).resolves.toMatchObject({ id: "p3" });
+    await expect(adapter.findMany({ model: "plugin", where, limit: 1, offset: 1 })).resolves.toEqual([expect.objectContaining({ id: "p4" })]);
+    const capped = adapterFor({ ...options, maxPages: 4 });
+    await expect(capped.findMany({ model: "plugin", where, limit: 1, offset: 1 })).rejects.toThrow(/maxPages/);
   });
 
   it("sorts numeric fields numerically in DynamoDB-backed findMany", async () => {
@@ -293,6 +337,17 @@ describe("DynamoDB Local adapter integration", () => {
     await create(adapter, "member", { id: "mixed-mode", email: "a@example.com", role: "admin", organizationId: "org-mixed", active: true });
 
     await expect(adapter.findMany({ model: "member", where: [insensitiveInValues("email", ["A@EXAMPLE.COM"]), inValues("role", ["admin"])] as never, limit: 10 })).resolves.toEqual([expect.objectContaining({ id: "mixed-mode" })]);
+  });
+
+  it("evaluates case-insensitive id IN after the selected safe anchor", async () => {
+    const adapter = adapterFor({ client: docClient });
+    await create(adapter, "member", { id: "mixed-id", email: "a@example.com", role: "admin", organizationId: "org-mixed", active: true });
+    await create(adapter, "member", { id: "other-id", email: "b@example.com", role: "admin", organizationId: "org-mixed", active: true });
+    const insensitiveIds = insensitiveInValues("id", ["MIXED-ID"]);
+
+    for (const anchor of [eq("organizationId", "org-mixed"), inValues("role", ["admin"]), inValues("id", ["mixed-id", "other-id"])]) {
+      await expect(adapter.findMany({ model: "member", where: [insensitiveIds, anchor] as never, limit: 10 })).resolves.toEqual([expect.objectContaining({ id: "mixed-id" })]);
+    }
   });
 
   it("accepts exactly 1,000 distinct indexed IN values and rejects 1,001 before reading", async () => {

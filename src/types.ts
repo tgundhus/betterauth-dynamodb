@@ -16,7 +16,7 @@ export interface BetterAuthDynamoDBOptions {
   uniqueFields?: Record<string, string[]>;
   /** Opt in to Better Auth schema `indexes` unique constraints. */
   enforceSchemaUniqueIndexes?: boolean;
-  /** Maximum number of independent bulk transactions in flight. */
+  /** Maximum concurrent bulk transactions, scalar IN queries, or BatchGet chunks. */
   maxBulkConcurrency?: number;
 }
 

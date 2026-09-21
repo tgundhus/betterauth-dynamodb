@@ -27,6 +27,7 @@ export default class Api extends AWS.Lambda.Function<Api>()(
     });
 
     yield* AWS.DynamoDB.GetItem(table);
+    yield* AWS.DynamoDB.BatchGetItem(table);
     yield* AWS.DynamoDB.Query(table);
     yield* AWS.DynamoDB.TransactWriteItems(table);
     const authSecret = yield* Config.redacted("BETTER_AUTH_SECRET");

@@ -8,9 +8,9 @@ Alchemy v2 is currently published on npm as a beta (`alchemy@2.0.0-beta.64`, wit
 
 - DynamoDB table with `pk` partition key, `sk` sort key, and TTL enabled on `ttl`.
 - Lambda Function URL handler that injects a `DynamoDBDocumentClient` into `@bjorntech/betterauth-dynamodb`.
-- Least-privilege DynamoDB bindings for the adapter's default command paths: `GetItem`, `Query`, and `TransactWriteItems`.
+- Least-privilege DynamoDB bindings for the adapter's default command paths: `GetItem`, `BatchGetItem`, `Query`, and `TransactWriteItems`.
 
-This example does not grant `Scan`. Keep `unsafeAllowScan` disabled unless you intentionally add a `Scan` binding and accept that access pattern.
+Version 1.2 requires the `BatchGetItem` binding for indexed owner reads and `id IN` queries. The opt-in `unsafeAllowScan` path now uses the existing `Query` binding against a model partition; no `Scan` binding is needed. Keep that option disabled unless you accept the cost of reading a model partition.
 
 ## Setup
 

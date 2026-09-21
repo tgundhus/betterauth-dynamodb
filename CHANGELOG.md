@@ -11,6 +11,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Replaced opt-in table scans with strongly consistent queries against the existing model partition, avoiding reads of sidecars, unique locks, and unrelated models.
 - Replaced per-owner and `id IN` `GetItem` calls with strongly consistent, concurrency-bounded `BatchGetItem` requests, including 100-key chunking, stable result ordering, and bounded retries with exponential backoff for unprocessed keys.
 - Run scalar-field `IN` sidecar queries with bounded concurrency while preserving their shared global page budget.
+- Stop unsorted limited equality/model reads once enough live, matching rows satisfy offset and limit. Sorted reads, counts, bulk mutations, and `IN` reads still load complete candidate sets.
+
+### Fixed
+
+- Continue processing size-limited `BatchGetItem` responses while keys make progress, with bounded retries for consecutive responses that make no progress.
+- Evaluate case-insensitive `id IN` predicates through a separate safe anchor instead of incorrectly using case-sensitive entity keys.
+- Grant `BatchGetItem` in the Alchemy example and document the additional IAM permission required when upgrading from 1.1.
+- Avoid overlapping DynamoDB update expressions when incrementing or setting an ordinary `ttl` field while adapter-managed TTL is disabled.
+- Recheck logical expiry while filling paginated windows and omit rows that expire during a read instead of returning empty records or counting them toward offsets.
 
 ### Added
 
@@ -55,7 +64,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Defines the 1.0 storage layout contract for entity rows, scalar equality sidecar rows, unique lock rows, delimiter-safe length-prefixed key components, hashed sidecar/lock values, and hidden revision metadata.
 - Includes unit coverage, DynamoDB Local integration tests, Better Auth adapter conformance suites, coverage thresholds, and a per-production-function CRAP `<= 6` quality gate through `bun run verify`.
 
-[1.2.0]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.1.0...v1.2.0
+[1.2.0]: https://github.com/tgundhus/betterauth-dynamodb/compare/v1.1.0...main
 [1.1.0]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/bjorntech/betterauth-dynamodb/releases/tag/v1.0.0

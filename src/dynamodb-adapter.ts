@@ -3,6 +3,7 @@ import {
   GetCommand,
   QueryCommand,
   TransactWriteCommand,
+  type QueryCommandInput,
   type TransactWriteCommandInput,
   type DynamoDBDocumentClient
 } from "@aws-sdk/lib-dynamodb";
@@ -17,7 +18,7 @@ import { eqWhere, firstEquality, inWhere, matchesWhere, planQuery, safeInWhere, 
 const MAX_TRANSACT_ITEMS = 100;
 const MAX_IN_VALUES = 1000;
 const MAX_BATCH_GET_ITEMS = 100;
-const MAX_BATCH_GET_ATTEMPTS = 8;
+const MAX_BATCH_GET_STALLED_ATTEMPTS = 8;
 
 export class DynamoDBStore {
   private readonly client: DynamoDBDocumentClient;
@@ -41,7 +42,7 @@ export class DynamoDBStore {
 
   async findMany<T>(model: string, where: CleanedWhere[] = [], limit = 100, offset = 0, sortBy?: { field: string; direction: "asc" | "desc" }, select?: string[]): Promise<T[]> {
     const plan = planQuery(where, this.options.unsafeAllowScan);
-    const rows = await this.loadRows(model, plan);
+    const rows = await this.loadRows(model, plan, sortBy ? undefined : readWindowSize(limit, offset));
     return selectWindow(rows.filter((row) => matchesWhere(row, where)), limit, offset, sortBy, this.options.ttl, select) as T[];
   }
 
@@ -129,12 +130,12 @@ export class DynamoDBStore {
     return rows.length;
   }
 
-  private async loadRows(model: string, plan: QueryPlan): Promise<StoredItem[]> {
+  private async loadRows(model: string, plan: QueryPlan, take?: number): Promise<StoredItem[]> {
     if (plan.kind === "byId") return this.loadById(model, plan.where);
     if (plan.kind === "byIdValues") return this.loadByIds(model, plan.where);
-    if (plan.kind === "byFieldValue") return this.loadByField(model, plan.where);
+    if (plan.kind === "byFieldValue") return this.loadByField(model, plan.where, take);
     if (plan.kind === "byFieldValues") return this.loadByFields(model, plan.where);
-    return this.queryModel(model);
+    return this.queryModel(model, plan.where, take);
   }
 
   private async loadById(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
@@ -143,16 +144,33 @@ export class DynamoDBStore {
     return visibleRows(result.Item ? [result.Item as StoredItem] : [], this.options.ttl);
   }
 
-  private async loadByField(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
+  private async loadByField(model: string, where: CleanedWhere[], take?: number): Promise<StoredItem[]> {
     const clause = firstEquality(where);
     if (!clause) return [];
+    if (take !== undefined) {
+      const command = sidecarQuery(this.options.tableName, model, clause, this.options.consistentRead, this.options.pageSize);
+      return this.queryWindow<SidecarItem>(command, where, take, (items) => this.loadOwners(items, clause));
+    }
     const sidecars = await this.queryAllSidecars(model, clause);
     return this.loadOwners(sidecars, clause);
   }
 
-  private async queryModel(model: string): Promise<StoredItem[]> {
+  private async queryModel(model: string, where: CleanedWhere[], take?: number): Promise<StoredItem[]> {
+    if (take !== undefined) {
+      const command = modelQuery(this.options.tableName, model, this.options.consistentRead, this.options.pageSize);
+      return this.queryWindow<StoredItem>(command, where, take, async (items) => items);
+    }
     const items = await this.queryAllModel(model);
     return visibleRows(items, this.options.ttl);
+  }
+
+  private async queryWindow<T>(command: QueryCommandInput, where: CleanedWhere[], take: number, hydrate: (items: T[]) => Promise<StoredItem[]>): Promise<StoredItem[]> {
+    return drainPages<StoredItem>(async (key) => {
+      const page = await this.client.send(new QueryCommand({ ...command, ExclusiveStartKey: key }));
+      const owners = await hydrate((page.Items ?? []) as T[]);
+      const rows = visibleRows(owners, this.options.ttl).filter((row) => matchesWhere(row, where));
+      return { ...pageOf<StoredItem>(page), Items: rows };
+    }, this.options.maxPages, undefined, (rows) => visibleRows(rows, this.options.ttl).length >= take);
   }
 
   async transactCreate(items: { model: string; data: Record<string, unknown> }[]): Promise<void> {
@@ -264,9 +282,19 @@ function keyOf(item: Pick<StoredItem, "pk" | "sk">): { pk: string; sk: string } 
   return { pk: item.pk, sk: item.sk };
 }
 
+function readWindowSize(limit: number, offset: number): number | undefined {
+  if (!Number.isSafeInteger(limit) || limit <= 0) return undefined;
+  if (!Number.isSafeInteger(offset) || offset < 0) return undefined;
+  return Number.isSafeInteger(offset + limit) ? offset + limit : undefined;
+}
+
 function selectWindow(rows: StoredItem[], limit: number, offset: number, sortBy?: { field: string; direction: "asc" | "desc" }, ttl?: false | TtlOptions, select?: string[]): Record<string, unknown>[] {
   const sorted = sortBy ? [...rows].sort((a, b) => compareSort(a, b, sortBy)) : rows;
-  return sorted.slice(offset, offset + limit).map((row) => projectRecord(fromStoredItem<Record<string, unknown>>(row, ttl) ?? {}, select));
+  const records = sorted.flatMap((row) => {
+    const record = fromStoredItem<Record<string, unknown>>(row, ttl);
+    return record ? [record] : [];
+  });
+  return records.slice(offset, offset + limit).map((row) => projectRecord(row, select));
 }
 
 function projectRecord(row: Record<string, unknown>, select?: string[]): Record<string, unknown> {
@@ -384,6 +412,7 @@ function isAddableNumber(value: unknown): boolean {
 function optionalMetadataSetParts(newItem: StoredItem, names: Record<string, string>, values: Record<string, unknown>, ttl?: false | TtlOptions): string[] {
   const parts: string[] = [];
   if (newItem.createdAtSort !== undefined) parts.push(assignMetadata("#createdAtSort", "createdAtSort", ":createdAtSort", newItem.createdAtSort, names, values));
+  if (!ttl) return parts;
   const ttlName = ttlAttribute(ttl);
   if (newItem[ttlName] !== undefined) parts.push(assignMetadata("#ttl", ttlName, ":ttl", newItem[ttlName], names, values));
   return parts;
@@ -392,6 +421,7 @@ function optionalMetadataSetParts(newItem: StoredItem, names: Record<string, str
 function optionalMetadataRemoveParts(oldItem: StoredItem, newItem: StoredItem, names: Record<string, string>, ttl?: false | TtlOptions): string[] {
   const parts: string[] = [];
   if (oldItem.createdAtSort !== undefined && newItem.createdAtSort === undefined) parts.push(removeMetadata("#createdAtSort", "createdAtSort", names));
+  if (!ttl) return parts;
   const ttlName = ttlAttribute(ttl);
   if (oldItem[ttlName] !== undefined && newItem[ttlName] === undefined) parts.push(removeMetadata("#ttl", ttlName, names));
   return parts;
@@ -502,19 +532,20 @@ function conflictError(operation: string, cause: unknown): DynamoDBConflictError
   return new DynamoDBConflictError(`Better Auth DynamoDB ${operation} conflicted with a concurrent write after the target row was read. Retry the operation.`, { cause });
 }
 
-function drainPages<T>(load: (key?: Record<string, unknown>) => Promise<{ Items?: T[]; LastEvaluatedKey?: Record<string, unknown> }>, maxPages: number, budget?: { remaining: number }): Promise<T[]> {
-  return drainPagesInner(load, maxPages, undefined, [], 0, budget);
+function drainPages<T>(load: (key?: Record<string, unknown>) => Promise<{ Items?: T[]; LastEvaluatedKey?: Record<string, unknown> }>, maxPages: number, budget?: { remaining: number }, complete?: (items: T[]) => boolean): Promise<T[]> {
+  return drainPagesInner(load, maxPages, undefined, [], 0, budget, complete);
 }
 
 function pageOf<T>(result: { Items?: Record<string, unknown>[] | undefined; LastEvaluatedKey?: Record<string, unknown> | undefined }): { Items?: T[]; LastEvaluatedKey?: Record<string, unknown> } {
   return { ...(result.Items ? { Items: result.Items as T[] } : {}), ...(result.LastEvaluatedKey ? { LastEvaluatedKey: result.LastEvaluatedKey } : {}) };
 }
 
-async function drainPagesInner<T>(load: (key?: Record<string, unknown>) => Promise<{ Items?: T[]; LastEvaluatedKey?: Record<string, unknown> }>, maxPages: number, key: Record<string, unknown> | undefined, items: T[], page: number, budget?: { remaining: number }): Promise<T[]> {
+async function drainPagesInner<T>(load: (key?: Record<string, unknown>) => Promise<{ Items?: T[]; LastEvaluatedKey?: Record<string, unknown> }>, maxPages: number, key: Record<string, unknown> | undefined, items: T[], page: number, budget: { remaining: number } | undefined, complete?: (items: T[]) => boolean): Promise<T[]> {
   consumePageBudget(page, maxPages, budget);
   const result = await load(key);
-  const next = [...items, ...(result.Items ?? [])];
-  return result.LastEvaluatedKey ? drainPagesInner(load, maxPages, result.LastEvaluatedKey, next, page + 1, budget) : next;
+  for (const item of result.Items ?? []) items.push(item);
+  if (complete?.(items)) return items;
+  return result.LastEvaluatedKey ? drainPagesInner(load, maxPages, result.LastEvaluatedKey, items, page + 1, budget, complete) : items;
 }
 
 function consumePageBudget(page: number, maxPages: number, budget?: { remaining: number }): void {
@@ -562,15 +593,22 @@ function chunk<T>(items: T[], size: number): T[][] {
   return Array.from({ length: Math.ceil(items.length / size) }, (_, index) => items.slice(index * size, (index + 1) * size));
 }
 
-async function batchGetAttempts(client: DynamoDBDocumentClient, tableName: string, keys: { pk: string; sk: string }[], consistentRead: boolean, attempt = 1, rows: StoredItem[] = []): Promise<StoredItem[]> {
+async function batchGetAttempts(client: DynamoDBDocumentClient, tableName: string, keys: { pk: string; sk: string }[], consistentRead: boolean, stalledAttempts = 0, rows: StoredItem[] = []): Promise<StoredItem[]> {
   if (keys.length === 0) return rows;
   const result = await client.send(new BatchGetCommand({ RequestItems: { [tableName]: { Keys: keys, ConsistentRead: consistentRead } } }));
   const nextRows = [...rows, ...((result.Responses?.[tableName] ?? []) as StoredItem[])];
   const unprocessed = (result.UnprocessedKeys?.[tableName]?.Keys ?? []) as { pk: string; sk: string }[];
   if (unprocessed.length === 0) return nextRows;
-  if (attempt >= MAX_BATCH_GET_ATTEMPTS) throw new DynamoDBAdapterError(`Better Auth DynamoDB BatchGet still had ${unprocessed.length} unprocessed keys after ${attempt} attempts.`);
-  await batchGetBackoff(attempt);
-  return batchGetAttempts(client, tableName, unprocessed, consistentRead, attempt + 1, nextRows);
+  const nextStalledAttempts = batchGetStalledAttempts(keys.length, unprocessed.length, stalledAttempts);
+  await batchGetBackoff(Math.max(1, nextStalledAttempts));
+  return batchGetAttempts(client, tableName, unprocessed, consistentRead, nextStalledAttempts, nextRows);
+}
+
+function batchGetStalledAttempts(requested: number, unprocessed: number, previous: number): number {
+  // Size-limited responses and missing items can make progress without completing a batch.
+  const attempts = unprocessed < requested ? 0 : previous + 1;
+  if (attempts >= MAX_BATCH_GET_STALLED_ATTEMPTS) throw new DynamoDBAdapterError(`Better Auth DynamoDB BatchGet still had ${unprocessed} unprocessed keys after ${attempts} consecutive attempts without progress.`);
+  return attempts;
 }
 
 function batchGetBackoff(attempt: number): Promise<void> {
