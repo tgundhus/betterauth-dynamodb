@@ -7,8 +7,7 @@ import { REVISION_ATTRIBUTE } from "../src/serialize.js";
 
 describe("public adapter and client helpers", () => {
   it("normalizes option defaults and builds a document client", () => {
-    expect(normalizeOptions({ tableName: "auth" })).toMatchObject({ maxPages: 25, unsafeAllowScan: false, consistentRead: true });
-    expect(normalizeOptions({ tableName: "auth", consistentRead: false })).toMatchObject({ consistentRead: false });
+    expect(normalizeOptions({ tableName: "auth" })).toMatchObject({ maxPages: 25, unsafeAllowScan: false });
     expect(normalizeOptions({ tableName: "auth", pageSize: 10, maxPages: 2 })).toMatchObject({ pageSize: 10, maxPages: 2 });
     expect(createDocumentClient({ tableName: "auth", region: "us-east-1", endpoint: "http://localhost:8000" })).toBeTruthy();
   });
@@ -74,7 +73,7 @@ describe("public adapter and client helpers", () => {
 
   it("projects selected fields using transformed storage names", async () => {
     const send = vi.fn(async (command: { constructor: { name: string } }) => {
-      if (command.constructor.name === "QueryCommand") return { Items: [{ pk: "MODEL#s8:app_user", sk: "ID#s2:u1", id: "u1", email_address: "a@example.com", name: "Ada", [REVISION_ATTRIBUTE]: "rev-1", entity: { id: "u1", email_address: "a@example.com", name: "Ada" } }] };
+      if (command.constructor.name === "ScanCommand") return { Items: [{ pk: "MODEL#s8:app_user", sk: "ID#s2:u1", id: "u1", email_address: "a@example.com", name: "Ada", [REVISION_ATTRIBUTE]: "rev-1", entity: { id: "u1", email_address: "a@example.com", name: "Ada" } }] };
       return {};
     });
     const adapter = dynamoDBAdapter({ tableName: "auth", client: { send } as never, unsafeAllowScan: true })({ secret: "x", user: { modelName: "app_user", fields: { email: "email_address" } } } as never);

@@ -4,18 +4,6 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.2.0] - 2026-09-21
-
-### Changed
-
-- Replaced opt-in table scans with strongly consistent queries against the existing model partition, avoiding reads of sidecars, unique locks, and unrelated models.
-- Replaced per-owner and `id IN` `GetItem` calls with strongly consistent, concurrency-bounded `BatchGetItem` requests, including 100-key chunking, stable result ordering, and bounded retries with exponential backoff for unprocessed keys.
-- Run scalar-field `IN` sidecar queries with bounded concurrency while preserving their shared global page budget.
-
-### Added
-
-- Added `consistentRead` (default `true`) as a backwards-compatible option for workloads that explicitly prefer eventually consistent reads and lower RCU cost.
-
 ## [1.1.0] - 2026-09-19
 
 ### Added
@@ -55,7 +43,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Defines the 1.0 storage layout contract for entity rows, scalar equality sidecar rows, unique lock rows, delimiter-safe length-prefixed key components, hashed sidecar/lock values, and hidden revision metadata.
 - Includes unit coverage, DynamoDB Local integration tests, Better Auth adapter conformance suites, coverage thresholds, and a per-production-function CRAP `<= 6` quality gate through `bun run verify`.
 
-[1.2.0]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/bjorntech/betterauth-dynamodb/releases/tag/v1.0.0

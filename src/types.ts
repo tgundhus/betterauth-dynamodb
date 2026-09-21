@@ -9,8 +9,6 @@ export interface BetterAuthDynamoDBOptions {
   dynamoDBClientConfig?: DynamoDBClientConfig;
   ttl?: false | TtlOptions;
   unsafeAllowScan?: boolean;
-  /** Request strongly consistent reads. Defaults to true. */
-  consistentRead?: boolean;
   maxPages?: number;
   pageSize?: number;
   uniqueFields?: Record<string, string[]>;
