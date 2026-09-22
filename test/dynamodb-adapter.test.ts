@@ -708,6 +708,24 @@ describe("DynamoDBStore", () => {
     expect(doc.send.mock.calls.some((call) => call[0] instanceof TransactWriteCommand)).toBe(true);
   });
 
+  it.each(["asc", "desc"] as const)("keeps %s string sorting consistent with cursor range predicates", async (direction) => {
+    const ids = ["a", "Z", "A", "z", "é", "e", "😀", "\uE000"];
+    const rows = ids.map((id) => ({ pk: modelPk("user"), sk: entitySk(id), id, entity: { id }, ...rev }));
+    const doc = client(rows);
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, unsafeAllowScan: true });
+    const visited: unknown[] = [];
+    let cursor: unknown;
+    for (let page = 0; page < ids.length; page++) {
+      const where: CleanedWhere[] = cursor === undefined ? [] : [{ ...eq("id", cursor), operator: direction === "asc" ? "gt" : "lt" }];
+      const batch = await store.findMany<{ id: string }>("user", where, 2, 0, { field: "id", direction });
+      if (!batch.length) break;
+      visited.push(...batch.map((row) => row.id));
+      cursor = batch.at(-1)!.id;
+    }
+    const expected = [...ids].sort();
+    expect(visited).toEqual(direction === "asc" ? expected : expected.reverse());
+  });
+
   it("sorts numeric sortBy values numerically", async () => {
     const rows = [
       { pk: modelPk("user"), sk: entitySk("u1"), id: "u1", score: 10, entity: { id: "u1", score: 10 }, ...rev },

@@ -1,4 +1,5 @@
 import { createAdapterFactory } from "better-auth/adapters";
+import type { BetterAuthOptions } from "better-auth";
 import { DynamoDBStore } from "./dynamodb-adapter.js";
 import { UnsupportedQueryError } from "./errors.js";
 import { compoundUniqueIndexName } from "./keys.js";
@@ -6,8 +7,19 @@ import type { BetterAuthDynamoDBOptions, SchemaUniqueIndex } from "./types.js";
 
 export type { BetterAuthDynamoDBOptions, TtlOptions } from "./types.js";
 export { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError } from "./errors.js";
+export { initializeDynamoDBTransactions, recoverDynamoDBTransactions } from "./transactions/maintenance.js";
+export { DynamoDBTransactionOutcomeUnknownError } from "./transactions/engine.js";
+export { runDynamoDBRecoveryWorker } from "./transactions/worker.js";
+export type { DynamoDBRecoveryWorkerOptions, DynamoDBRecoveryWorkerResult } from "./transactions/worker.js";
+export type { TransactionRecoveryCursor, TransactionRecoveryResult, TransactionRecoveryOptions, TransactionRecoveryFailure } from "./transactions/maintenance.js";
 
 export function dynamoDBAdapter(adapterOptions: BetterAuthDynamoDBOptions) {
+  return adapterFactory(adapterOptions);
+}
+
+function adapterFactory(adapterOptions: BetterAuthDynamoDBOptions, scopedStore?: DynamoDBStore): ReturnType<typeof createAdapterFactory> {
+ return (options: BetterAuthOptions) => {
+  let store: DynamoDBStore;
   return createAdapterFactory({
     config: {
       adapterId: "betterauth-dynamodb",
@@ -17,12 +29,12 @@ export function dynamoDBAdapter(adapterOptions: BetterAuthDynamoDBOptions) {
       supportsJSON: true,
       supportsArrays: true,
       supportsNumericIds: false,
-      transaction: false
+      transaction: adapterOptions.transactions ? (callback) => store.transaction((scoped) => callback(adapterFactory(adapterOptions, scoped)(options))) : false
     },
-    adapter: ({ schema, getModelName, getFieldName }) => {
+    adapter: ({ schema, getModelName, getFieldName, getDefaultModelName, transformInput, transformOutput }) => {
       const schemaUniqueFields = collectUniqueFields(schema, getModelName, getFieldName);
       const schemaUniqueIndexes = adapterOptions.enforceSchemaUniqueIndexes ? collectSchemaUniqueIndexes(schema, getModelName, getFieldName) : [];
-      const store = new DynamoDBStore({ ...adapterOptions, uniqueFields: mergeUniqueFields(schemaUniqueFields, adapterOptions.uniqueFields), schemaUniqueIndexes });
+      store = scopedStore ?? new DynamoDBStore({ ...adapterOptions, uniqueFields: mergeUniqueFields(schemaUniqueFields, adapterOptions.uniqueFields), schemaUniqueIndexes });
       const adapter: any = {
         create: <T extends Record<string, unknown>>(data: { model: string; data: T }) => store.create(data.model, data.data),
         findOne: <T>(data: { model: string; where: any[]; select?: string[]; join?: Record<string, unknown> }) => {
@@ -41,11 +53,24 @@ export function dynamoDBAdapter(adapterOptions: BetterAuthDynamoDBOptions) {
         consumeOne: <T>(data: { model: string; where: any[] }) => store.consumeOne<T>(data.model, data.where),
         incrementOne: <T>(data: { model: string; where: any[]; increment: Record<string, number>; set?: Record<string, unknown> }) =>
           store.incrementOne<T>(data.model, data.where, data.increment, data.set),
-        options: { tableName: adapterOptions.tableName }
+        options: {
+          tableName: adapterOptions.tableName,
+          ...(scopedStore ? { transactionBatch: {
+            maxConcurrency: adapterOptions.maxBulkConcurrency ?? 8,
+            createMany: async (input: { model: string; data: Record<string, unknown>[] }) => {
+              const defaultModel = getDefaultModelName(input.model);
+              const model = getModelName(input.model);
+              const data = await Promise.all(input.data.map((row) => transformInput(row, defaultModel, "create")));
+              await store.transactCreate(data.map((row) => ({ model, data: row })));
+              return Promise.all(data.map((row) => transformOutput(row, defaultModel)));
+            }
+          } } : {})
+        }
       };
       return adapter;
     }
-  });
+  })(options);
+ };
 }
 
 function mergeUniqueFields(...sources: (Record<string, string[]> | undefined)[]): Record<string, string[]> {

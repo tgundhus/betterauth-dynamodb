@@ -1,5 +1,7 @@
 import type { DynamoDBClientConfig } from "@aws-sdk/client-dynamodb";
 import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import type { CallbackContext } from "./transactions/context.js";
+import type { TransactionEngine } from "./transactions/engine.js";
 
 export interface BetterAuthDynamoDBOptions {
   tableName: string;
@@ -18,11 +20,15 @@ export interface BetterAuthDynamoDBOptions {
   enforceSchemaUniqueIndexes?: boolean;
   /** Maximum concurrent bulk transactions, scalar IN queries, or BatchGet chunks. */
   maxBulkConcurrency?: number;
+  /** Opt in to the initialized, adapter-managed callback transaction storage protocol. */
+  transactions?: boolean;
 }
 
 /** Store options: public adapter options plus schema metadata resolved and validated by the adapter factory. */
 export interface DynamoDBStoreOptions extends BetterAuthDynamoDBOptions {
   schemaUniqueIndexes?: SchemaUniqueIndex[];
+  transactionContext?: CallbackContext;
+  transactionEngine?: TransactionEngine;
 }
 
 export interface SchemaUniqueIndex {

@@ -1,0 +1,68 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Transform": "AWS::Serverless-2016-10-31",
+  "Description": "Bounded Better Auth DynamoDB transaction recovery for an existing authentication table",
+  "Parameters": {
+    "TableName": { "Type": "String", "MinLength": 3, "AllowedPattern": "[a-zA-Z0-9_.-]+" },
+    "AlarmTopicArn": { "Type": "String", "Description": "Existing SNS topic used by your on-call alerting system" },
+    "TransactionTtlAttribute": { "Type": "String", "Default": "ttl", "Description": "Must match the transaction adapter TTL attribute and table TTL configuration" }
+  },
+  "Resources": {
+    "RecoveryDeadLetters": {
+      "Type": "AWS::SQS::Queue",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": { "MessageRetentionPeriod": 1209600, "SqsManagedSseEnabled": true }
+    },
+    "RecoveryFunction": {
+      "Type": "AWS::Serverless::Function",
+      "Properties": {
+        "CodeUri": "../../build/recovery-lambda/",
+        "Handler": "index.handler",
+        "Runtime": "nodejs22.x",
+        "Architectures": ["arm64"],
+        "Timeout": 240,
+        "MemorySize": 512,
+        "ReservedConcurrentExecutions": 1,
+        "Environment": { "Variables": { "TABLE_NAME": { "Ref": "TableName" }, "TRANSACTION_TTL_ATTRIBUTE": { "Ref": "TransactionTtlAttribute" } } },
+        "DeadLetterQueue": { "Type": "SQS", "TargetArn": { "Fn::GetAtt": ["RecoveryDeadLetters", "Arn"] } },
+        "EventInvokeConfig": { "MaximumEventAgeInSeconds": 300, "MaximumRetryAttempts": 1 },
+        "Policies": [{ "Statement": [{
+          "Effect": "Allow",
+          "Action": ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:ConditionCheckItem"],
+          "Resource": { "Fn::Sub": "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}" }
+        }] }],
+        "Events": {
+          "RecoverySchedule": { "Type": "ScheduleV2", "Properties": { "ScheduleExpression": "rate(5 minutes)", "FlexibleTimeWindow": { "Mode": "OFF" }, "RetryPolicy": { "MaximumEventAgeInSeconds": 300, "MaximumRetryAttempts": 1 }, "DeadLetterConfig": { "Type": "SQS", "Arn": { "Fn::GetAtt": ["RecoveryDeadLetters", "Arn"] } } } }
+        }
+      }
+    },
+    "RecoveryLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": { "LogGroupName": { "Fn::Sub": "/aws/lambda/${RecoveryFunction}" }, "RetentionInDays": 30 }
+    },
+    "RecoveryErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "Recovery failed or a damaged transaction needs investigation",
+        "Namespace": "AWS/Lambda", "MetricName": "Errors", "Statistic": "Sum", "Period": 300, "EvaluationPeriods": 1, "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold", "TreatMissingData": "notBreaching",
+        "Dimensions": [{ "Name": "FunctionName", "Value": { "Ref": "RecoveryFunction" } }],
+        "AlarmActions": [{ "Ref": "AlarmTopicArn" }]
+      }
+    },
+    "RecoveryDeadLetterAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "A scheduled recovery invocation could not be delivered or completed",
+        "Namespace": "AWS/SQS", "MetricName": "ApproximateNumberOfMessagesVisible", "Statistic": "Maximum", "Period": 300, "EvaluationPeriods": 1, "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold", "TreatMissingData": "notBreaching",
+        "Dimensions": [{ "Name": "QueueName", "Value": { "Fn::GetAtt": ["RecoveryDeadLetters", "QueueName"] } }],
+        "AlarmActions": [{ "Ref": "AlarmTopicArn" }]
+      }
+    }
+  },
+  "Outputs": { "RecoveryFunctionArn": { "Value": { "Fn::GetAtt": ["RecoveryFunction", "Arn"] } } }
+}

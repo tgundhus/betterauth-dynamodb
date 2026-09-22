@@ -2,6 +2,18 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      members:
+        description: Members in the DynamoDB Local provisioning load fixture
+        type: choice
+        options: ['1051', '10000']
+        default: '10000'
+      concurrency:
+        description: Adapter bulk and projection concurrency for the load fixture
+        type: choice
+        options: ['8', '16', '32', '64']
+        default: '8'
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -12,6 +24,13 @@ jobs:
           bun-version: 1.2.5
       - run: bun install --frozen-lockfile
       - run: bun run verify
+      - run: bun run build:recovery-worker
+      - run: node -e "import('./build/recovery-lambda/index.mjs').then(m => { if (typeof m.handler !== 'function') process.exit(1) })"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install cfn-lint==1.57.0
+      - run: cfn-lint --template examples/aws-lambda/recovery.template.json
   integration-local:
     runs-on: ubuntu-latest
     steps:
@@ -23,3 +42,46 @@ jobs:
       - run: docker version
       - run: docker pull amazon/dynamodb-local:2.6.1
       - run: bun run test:integration:local
+  enterprise-scale:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.5
+      - run: bun install --frozen-lockfile
+      - uses: actions/checkout@v4
+        with:
+          repository: tgundhus/better-auth
+          ref: 5f33f4cb1b08040bd90758b5bb0de9cc57e896f0
+          path: .enterprise-scim-source
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+          run_install: false
+      - run: pnpm install --frozen-lockfile --filter '@better-auth/scim...'
+        working-directory: .enterprise-scim-source
+      - run: pnpm --filter '@better-auth/scim^...' build
+        working-directory: .enterprise-scim-source
+      - run: pnpm --filter @better-auth/scim build
+        working-directory: .enterprise-scim-source
+      - run: pnpm exec vitest run packages/scim/src
+        working-directory: .enterprise-scim-source
+      - name: Install the pinned SCIM module for the contract
+        run: |
+          mkdir -p node_modules/.scim-enterprise-preview
+          cp .enterprise-scim-source/packages/scim/dist/index.mjs node_modules/.scim-enterprise-preview/index.mjs
+      - run: docker pull amazon/dynamodb-local:2.6.1
+      - name: Exercise Bulk and large-group lifecycle on DynamoDB Local
+        env:
+          SCIM_PREVIEW_MODULE: node_modules/.scim-enterprise-preview/index.mjs
+          SCIM_PREVIEW_DYNAMODB: '1'
+          SCIM_SCALE_MEMBERS: ${{ inputs.members || '1051' }}
+          SCIM_PREVIEW_CONCURRENCY: ${{ inputs.concurrency || '8' }}
+        run: node node_modules/vitest/vitest.mjs run --config vitest.preview.config.ts

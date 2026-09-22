@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 2.0.0-alpha.0 - Unreleased
+
+### Added
+
+- Opt-in callback transactions backed by a durable DynamoDB journal, conditional item preparation, one commit decision, and resumable cleanup. Callbacks read their staged changes and can exceed one native 100-action transaction.
+- Explicit transaction storage initialization and registry-based recovery APIs, with an error carrying the transaction ID when commit outcome cannot be resolved.
+- Published SCIM and SSO HTTP integration contracts covering provisioning, role projection rollback, identity linking, deactivation, session revocation, and guarded provider mutations.
+- A separate large-group and Bulk contract test for the companion SCIM source changes.
+
+### Changed
+
+- The preview requires Better Auth `^1.7.5`. Transaction mode forces strongly consistent reads and removes the default page and IN-cardinality limits while retaining bounded native requests.
+- Transaction-mode storage requires all readers and writers to participate in the new protocol. Existing keys are preserved, but mixed versions and raw table consumers require a migration plan.
+- Transaction reads filter staged replacements before cloning them, avoiding copies of unrelated staged records during point lookups in large callbacks.
+- Transaction-scoped multi-row creates batch strongly consistent absence checks, and the companion SCIM fork can use `maxBulkConcurrency` for independent projection work on distinct users while retaining one atomic Group commit.
+
+### Fixed
+
+- String sorting and range filters now use the same ordinal comparisons, preventing skipped users during cursor-based reconciliation and connection decommissioning.
+- Recovery packs small journal entries into larger native batches using compatible optional size hints, retries a cleanup race as a batch, and rejects TTL field names that could expire active journal entries.
+- Recovery can be bounded across Lambda invocations, retains durable cleanup progress, and reports damaged transactions without blocking unrelated maintenance. A scheduled worker and AWS SAM deployment example are included.
+- A transient storage-format read failure no longer leaves the adapter permanently unavailable. A later request retries initialization on the same adapter instance.
+
+This is an unpublished preview. Real AWS load, conflict/recovery testing, and migration rehearsals remain required before production release. Stable 1.2 behavior remains available on `release/1.2`.
+
 ## [1.2.0] - 2026-09-21
 
 ### Changed
@@ -64,7 +89,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Defines the 1.0 storage layout contract for entity rows, scalar equality sidecar rows, unique lock rows, delimiter-safe length-prefixed key components, hashed sidecar/lock values, and hidden revision metadata.
 - Includes unit coverage, DynamoDB Local integration tests, Better Auth adapter conformance suites, coverage thresholds, and a per-production-function CRAP `<= 6` quality gate through `bun run verify`.
 
-[1.2.0]: https://github.com/tgundhus/betterauth-dynamodb/compare/v1.1.0...main
+[1.2.0]: https://github.com/tgundhus/betterauth-dynamodb/compare/v1.1.0...release/1.2
 [1.1.0]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/bjorntech/betterauth-dynamodb/releases/tag/v1.0.0

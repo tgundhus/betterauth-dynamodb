@@ -12,10 +12,14 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
 import { betterAuth } from "better-auth";
 import { oauthProvider } from "@better-auth/oauth-provider";
-import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../../src/index.js";
+import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter, initializeDynamoDBTransactions, recoverDynamoDBTransactions, runDynamoDBRecoveryWorker } from "../../src/index.js";
+import { DynamoDBStore } from "../../src/dynamodb-adapter.js";
+import { INTENT } from "../../src/transactions/format.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 import { compoundUniqueIndexName, compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../../src/serialize.js";
+import { enterpriseContract } from "../helpers/enterprise-contract.js";
+import { ssoContract, ssoGuardContract } from "../helpers/sso-contract.js";
 
 const IMAGE = "amazon/dynamodb-local:2.6.1";
 const REGION = "us-east-1";
@@ -62,6 +66,89 @@ describe("DynamoDB Local adapter integration", () => {
     await deleteTable(nativeClient, tableName);
   });
 
+  it("resumes bounded recovery through durable Lambda checkpoints on native DynamoDB", async () => {
+    let interrupt = true;
+    const broken = { config: docClient.config, send: async (command: any) => {
+      if (interrupt && command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("cleanup interrupted");
+      return docClient.send(command);
+    } } as unknown as DynamoDBDocumentClient;
+    const options = { tableName, client: broken, transactions: true };
+    await initializeDynamoDBTransactions(options);
+    const store = new DynamoDBStore(options);
+    await store.transaction(async (trx) => {
+      for (let index = 0; index < 55; index++) await trx.create("member", { id: `bounded-${index}`, groupId: "g" });
+    });
+    expect((await rawRow(modelPk("member"), entitySk("bounded-0")))?.[INTENT]).toBeDefined();
+    interrupt = false;
+    let recovered = 0;
+    for (let invocation = 0; invocation < 100 && recovered === 0; invocation++) {
+      const result = await runDynamoDBRecoveryWorker(options, { maxCalls: 2, maxBatchesPerTransaction: 1 });
+      recovered += result.recovered;
+      expect(result.failures).toEqual([]);
+    }
+    expect(recovered).toBe(1);
+    expect(await store.count("member", [eq("groupId", "g")])).toBe(55);
+    expect((await rawRow(modelPk("member"), entitySk("bounded-0")))?.[INTENT]).toBeUndefined();
+    expect(await rawRow("BETTERAUTH#MAINTENANCE", "transactions")).toHaveProperty("revision");
+  });
+
+  it("atomically commits a callback spanning more than 1,000 physical items", async () => {
+    const options = { tableName, client: docClient, transactions: true, uniqueFields: { member: ["membershipKey"] } };
+    await initializeDynamoDBTransactions(options);
+    const store = new DynamoDBStore(options);
+    await store.transaction(async (trx) => {
+      for (let index = 0; index < 145; index++) await trx.create("member", { id: `member-${index}`, connectionId: "c", groupId: "g", scimUserId: `user-${index}`, membershipKey: `membership-${index}`, createdAt: "2026-01-01T00:00:00.000Z" });
+      expect(await trx.count("member", [eq("groupId", "g")])).toBe(145);
+      expect(await store.count("member", [eq("groupId", "g")])).toBe(0);
+    });
+    expect(await store.count("member", [eq("groupId", "g")])).toBe(145);
+    expect(await recoverDynamoDBTransactions(options)).toMatchObject({ examined: 0 });
+    expect((await rawRow(modelPk("member"), entitySk("member-0")))?.[INTENT]).toBeUndefined();
+  });
+
+  it("journals only selected query records while retaining conflicts on selected records", async () => {
+    const manifests: number[] = [];
+    const client = { config: docClient.config, send: async (command: any) => {
+      if (command instanceof TransactWriteCommand) {
+        for (const action of command.input.TransactItems ?? []) {
+          if (action.Put?.Item?.state === "PREPARING") manifests.push(Number(action.Put.Item.count));
+        }
+      }
+      return docClient.send(command);
+    } } as unknown as DynamoDBDocumentClient;
+    const options = { tableName, client, transactions: true, pageSize: 2, unsafeAllowScan: true };
+    await initializeDynamoDBTransactions(options);
+    const store = new DynamoDBStore(options);
+    for (const key of ["a", "b", "c", "d"]) await store.create("user", { id: key, team: "x" });
+    for (const where of [[eq("team", "x")], [inValues("team", ["x"])], []]) {
+      await store.transaction(async (trx) => {
+        expect(await trx.findMany("user", where, 1, 1, { field: "id", direction: "asc" }, ["id"])).toEqual([{ id: "b" }]);
+        await store.update("user", [eq("id", "c")], { name: randomUUID() });
+      });
+      expect(manifests.at(-1)).toBe(1);
+    }
+    await expect(store.transaction(async (trx) => {
+      await trx.findMany("user", [eq("team", "x")], 1, 1, { field: "id", direction: "asc" });
+      await store.update("user", [eq("id", "b")], { name: "concurrent" });
+    })).rejects.toThrow();
+    expect(await store.findOne("user", [eq("id", "b")])).toMatchObject({ name: "concurrent" });
+  });
+
+  it("restores every prepared item when a later callback prepare batch fails", async () => {
+    const broken = { send: async (command: any) => {
+      if (command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Update?.ExpressionAttributeValues?.[":before"] === 99)) throw new Error("injected prepare failure");
+      return docClient.send(command);
+    } } as unknown as DynamoDBDocumentClient;
+    const options = { tableName, client: broken, transactions: true };
+    await initializeDynamoDBTransactions(options);
+    const store = new DynamoDBStore(options);
+    await expect(store.transaction(async (trx) => {
+      for (let index = 0; index < 55; index++) await trx.create("member", { id: `member-${index}`, groupId: "g" });
+    })).rejects.toThrow("injected prepare failure");
+    expect(await store.count("member", [eq("groupId", "g")])).toBe(0);
+    expect(await recoverDynamoDBTransactions(options)).toMatchObject({ examined: 0 });
+  });
+
   it("creates and reads by id through an injected DynamoDBDocumentClient", async () => {
     const adapter = adapterFor({ client: docClient });
 
@@ -69,6 +156,18 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(adapter.findOne({ model: "user", where: [eq("id", "u1")] })).resolves.toMatchObject({ id: "u1", email: "a@example.com", name: "Ada" });
 
     await expect(rawRow(modelPk("user"), entitySk("u1"))).resolves.toMatchObject({ model: "user", entity: { id: "u1", email: "a@example.com" } });
+  });
+
+  it("runs published SCIM provisioning and projection rollback entirely on DynamoDB", async () => {
+    await enterpriseContract({ tableName, client: docClient });
+  });
+
+  it("runs SSO resolution, rollback and SCIM session revocation entirely on DynamoDB", async () => {
+    await ssoContract({ tableName, client: docClient });
+  });
+
+  it("rolls back rejected provider guards and commits allowed provider mutations on DynamoDB", async () => {
+    await ssoGuardContract({ tableName, client: docClient });
   });
 
   it("maintains multiple scalar plugin-like equality sidecars in one table", async () => {
@@ -272,6 +371,27 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(adapter.findMany({ model: "plugin", where, limit: 1, offset: 1 })).resolves.toEqual([expect.objectContaining({ id: "p4" })]);
     const capped = adapterFor({ ...options, maxPages: 4 });
     await expect(capped.findMany({ model: "plugin", where, limit: 1, offset: 1 })).rejects.toThrow(/maxPages/);
+  });
+
+  it.each([false, true])("does not skip mixed-case identifiers during cursor pagination with transactions=%s", async (transactions) => {
+    const options = { tableName, client: docClient, transactions };
+    if (transactions) await initializeDynamoDBTransactions(options);
+    const store = new DynamoDBStore(options);
+    const ids = ["a", "Z", "A", "z", "é", "e", "😀", "\uE000"];
+    for (const id of ids) await store.create("member", { id, domain: "cursor-test", userId: id });
+    for (const direction of ["asc", "desc"] as const) {
+      const visited: unknown[] = [];
+      let cursor: unknown;
+      for (let page = 0; page < ids.length; page++) {
+        const where = [eq("domain", "cursor-test"), ...(cursor === undefined ? [] : [{ ...eq("userId", String(cursor)), operator: direction === "asc" ? "gt" as const : "lt" as const }])];
+        const batch = await store.findMany<{ userId: string }>("member", where, 2, 0, { field: "userId", direction });
+        if (!batch.length) break;
+        visited.push(...batch.map((row) => row.userId));
+        cursor = batch.at(-1)!.userId;
+      }
+      const expected = [...ids].sort();
+      expect(visited).toEqual(direction === "asc" ? expected : expected.reverse());
+    }
   });
 
   it("sorts numeric fields numerically in DynamoDB-backed findMany", async () => {

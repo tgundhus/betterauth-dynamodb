@@ -1,0 +1,498 @@
+import { BatchGetCommand, GetCommand, NumberValue, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { describe, expect, it } from "vitest";
+import { DynamoDBStore } from "../src/dynamodb-adapter.js";
+import { initializeDynamoDBTransactions, recoverDynamoDBTransactions } from "../src/transactions/maintenance.js";
+import { FORMAT_KEY, INTENT, keyId, PHYSICAL_VERSION, rootKey, versioned } from "../src/transactions/format.js";
+import { JournalCodec } from "../src/transactions/codec.js";
+import { TransactionEngine, DynamoDBTransactionOutcomeUnknownError } from "../src/transactions/engine.js";
+import { Journal } from "../src/transactions/journal.js";
+import type { Change } from "../src/transactions/types.js";
+import type { CleanedWhere } from "../src/types.js";
+import { MemoryDynamoDB } from "./helpers/memory-dynamodb.js";
+
+const eq = (field: string, value: string): CleanedWhere[] => [{ field, value, operator: "eq", mode: "sensitive" }];
+const id = (value: string) => eq("id", value);
+
+async function fixture() {
+  const db = new MemoryDynamoDB();
+  const options = { tableName: "auth", client: db.asClient(), transactions: true, unsafeAllowScan: true, uniqueFields: { user: ["email"] } };
+  await initializeDynamoDBTransactions(options);
+  return { db, options, store: new DynamoDBStore(options) };
+}
+
+function changes(count: number): Change[] {
+  return Array.from({ length: count }, (_, index) => { const key = { pk: "MODEL#test", sk: String(index) }; return { key, before: null, after: { ...key, value: index } }; });
+}
+
+function updates(command: any): Record<string, any>[] { return command instanceof TransactWriteCommand ? (command.input.TransactItems ?? []).flatMap((action) => action.Update ?? []) : []; }
+
+describe("DynamoDB callback transactions", () => {
+  it("recovers the same adapter instance after a transient format-marker read failure", async () => {
+    const { store, db } = await fixture();
+    let failures = 1;
+    db.before = (command) => {
+      if (command instanceof GetCommand && command.input.Key?.pk === FORMAT_KEY.pk && failures-- > 0) throw new Error("temporary marker read outage");
+    };
+    await expect(store.findOne("user", id("missing"))).rejects.toThrow("temporary marker read outage");
+    expect(await store.findOne("user", id("missing"))).toBeNull();
+    await store.create("user", { id: "available", email: "available@example.test" });
+    expect(await store.findOne("user", id("available"))).toMatchObject({ id: "available" });
+  });
+  it("filters staged replacements without resurrecting old indexed values or exposing mutable staged records", async () => {
+    const { store } = await fixture();
+    await store.create("user", { id: "existing", email: "old@example.test", profile: { label: "original" } });
+    await store.transaction(async (trx) => {
+      await trx.update("user", id("existing"), { email: "new@example.test" });
+      expect(await trx.findOne("user", eq("email", "old@example.test"))).toBeNull();
+      expect(await trx.count("user", eq("email", "old@example.test"))).toBe(0);
+      const row = await trx.findOne<{ profile: { label: string } }>("user", eq("email", "new@example.test"));
+      row!.profile.label = "outside mutation";
+      expect(await trx.findOne("user", id("existing"))).toMatchObject({ profile: { label: "original" } });
+    });
+    expect(await store.findOne("user", id("existing"))).toMatchObject({ email: "new@example.test", profile: { label: "original" } });
+  });
+  it("rejects TTL configuration that would overwrite the durable decision", async () => {
+    const db = new MemoryDynamoDB();
+    await expect(initializeDynamoDBTransactions({ tableName: "auth", client: db.asClient(), transactions: true, ttl: { attributeName: "state", fields: {} } })).rejects.toThrow("reserved journal metadata");
+    expect(db.rows.size).toBe(0);
+  });
+
+  it("rejects TTL attributes that would expire active journal entries", async () => {
+    const db = new MemoryDynamoDB();
+    for (const attributeName of ["before", "after", "restoreBytes", "target", "bytes"]) {
+      await expect(initializeDynamoDBTransactions({ tableName: "auth", client: db.asClient(), ttl: { attributeName, fields: {} } })).rejects.toThrow("reserved journal metadata");
+    }
+    expect(db.rows.size).toBe(0);
+  });
+  it("commits more than 100 physical items and reads its own creates, updates, increments and deletes", async () => {
+    const { store, db } = await fixture();
+    const result = await store.transaction(async (trx) => {
+      for (let index = 0; index < 45; index++) await trx.create("user", { id: String(index), email: `user${index}@example.test`, count: 0 });
+      expect(await trx.count("user")).toBe(45);
+      await trx.update("user", id("0"), { email: "changed@example.test" });
+      expect(await trx.findOne("user", eq("email", "changed@example.test"))).toMatchObject({ id: "0" });
+      expect(await trx.incrementOne("user", id("0"), { count: 2 })).toMatchObject({ count: 2 });
+      await trx.delete("user", id("1"));
+      expect(await trx.findOne("user", id("1"))).toBeNull();
+      expect(await store.count("user")).toBe(0);
+      return "committed";
+    });
+    expect(result).toBe("committed");
+    expect(await store.count("user")).toBe(44);
+    expect(await store.findOne("user", id("0"))).toMatchObject({ count: 2, email: "changed@example.test" });
+    expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
+  });
+
+  it("batch-checks transactional create absence without changing atomic visibility", async () => {
+    const { store, db } = await fixture();
+    db.commands.length = 0;
+    await store.transaction(async (trx) => {
+      await trx.transactCreate(Array.from({ length: 205 }, (_, index) => ({ model: "member", data: { id: `m-${index}`, groupId: "g" } })));
+      expect(db.commands.filter((command) => command instanceof BatchGetCommand)).toHaveLength(3);
+      expect(db.commands.filter((command) => command instanceof GetCommand && String(command.input.Key?.pk).startsWith("MODEL#"))).toHaveLength(0);
+      expect(await trx.count("member", eq("groupId", "g"))).toBe(205);
+      expect(await store.count("member", eq("groupId", "g"))).toBe(0);
+    });
+    expect(await store.count("member", eq("groupId", "g"))).toBe(205);
+  });
+
+  it("discards callback failures, including a saved transaction adapter used after its lifetime", async () => {
+    const { store } = await fixture();
+    let saved: DynamoDBStore | undefined;
+    await expect(store.transaction(async (trx) => { saved = trx; await trx.create("user", { id: "a" }); throw new Error("cancel"); })).rejects.toThrow("cancel");
+    expect(await store.findOne("user", id("a"))).toBeNull();
+    await expect(saved!.create("user", { id: "b" })).rejects.toThrow("no longer active");
+  });
+
+  it("rejects stale read-only and absent-row dependencies without publishing its writes", async () => {
+    const { store } = await fixture();
+    await store.create("user", { id: "source", email: "source@example.test" });
+    await expect(store.transaction(async (trx) => {
+      await trx.findOne("user", id("source"));
+      await trx.create("session", { id: "s" });
+      await store.update("user", id("source"), { email: "new@example.test" });
+    })).rejects.toThrow();
+    expect(await store.findOne("session", id("s"))).toBeNull();
+    await expect(store.transaction(async (trx) => {
+      expect(await trx.findOne("user", id("missing"))).toBeNull();
+      await trx.create("session", { id: "s2" });
+      await store.create("user", { id: "missing" });
+    })).rejects.toThrow();
+    expect(await store.findOne("session", id("s2"))).toBeNull();
+  });
+
+  it.each(["indexed", "model", "in"])("protects only the returned window of a %s query", async (kind) => {
+    const { store, db } = await fixture();
+    for (const key of ["a", "b", "c"]) await store.create("user", { id: key, team: "x" });
+    const where: CleanedWhere[] = kind === "model" ? [] : kind === "in" ? [{ field: "team", value: ["x"], operator: "in", mode: "sensitive" }] : eq("team", "x");
+    await store.transaction(async (trx) => {
+      expect(await trx.findMany("user", where, 1, 1, { field: "id", direction: "asc" }, ["id"])).toEqual([{ id: "b" }]);
+      await store.update("user", id("a"), { name: "concurrent before window" });
+      await store.update("user", id("c"), { name: "concurrent after window" });
+    });
+    const decision = [...db.rows.values()].find((row) => row.state === "COMMITTED");
+    expect(decision).toMatchObject({ count: 1, cleaned: true });
+    await expect(store.transaction(async (trx) => {
+      await trx.findMany("user", where, 1, 1, { field: "id", direction: "asc" });
+      await store.update("user", id("b"), { name: "selected row changed" });
+    })).rejects.toThrow();
+  });
+
+  it("does not journal candidates rejected by residual filters, but protects counted records", async () => {
+    const { store, db } = await fixture();
+    await store.create("user", { id: "a", team: "x", name: "selected" });
+    await store.create("user", { id: "b", team: "x", name: "ignored" });
+    const where: CleanedWhere[] = [...eq("team", "x"), { field: "name", value: "select", operator: "starts_with", mode: "sensitive" }];
+    await store.transaction(async (trx) => {
+      expect(await trx.count("user", where)).toBe(1);
+      expect(await trx.findOne("user", where)).toMatchObject({ id: "a" });
+      await store.update("user", id("b"), { name: "still ignored" });
+    });
+    expect([...db.rows.values()].find((row) => row.state === "COMMITTED")).toMatchObject({ count: 1 });
+    await expect(store.transaction(async (trx) => {
+      expect(await trx.count("user", where)).toBe(1);
+      await store.update("user", id("a"), { name: "concurrently changed" });
+    })).rejects.toThrow();
+  });
+
+  it("retains point-read absence in ID IN while filtering query candidates", async () => {
+    const { store } = await fixture();
+    await expect(store.transaction(async (trx) => {
+      expect(await trx.findMany("user", [{ field: "id", value: ["missing"], operator: "in", mode: "sensitive" }])).toEqual([]);
+      await store.create("user", { id: "missing" });
+    })).rejects.toThrow();
+  });
+
+  it("poisons a callback after a repeated selected query observes a changed version", async () => {
+    const { store } = await fixture();
+    await store.create("user", { id: "a", team: "x" });
+    await expect(store.transaction(async (trx) => {
+      await trx.findOne("user", eq("team", "x"));
+      await store.update("user", id("a"), { name: "changed" });
+      await expect(trx.findOne("user", eq("team", "x"))).rejects.toThrow("concurrent change");
+    })).rejects.toThrow("concurrent change");
+  });
+
+  it("retains dependencies from concurrent queries and guards query lifetime", async () => {
+    const { store } = await fixture();
+    let saved!: DynamoDBStore;
+    for (const key of ["a", "b"]) await store.create("user", { id: key, team: "x" });
+    await expect(store.transaction(async (trx) => {
+      saved = trx;
+      const results = await Promise.all([0, 1].map((offset) => trx.findMany("user", eq("team", "x"), 1, offset, { field: "id", direction: "asc" })));
+      expect(results).toEqual([[{ id: "a", team: "x" }], [{ id: "b", team: "x" }]]);
+      await store.update("user", id("a"), { name: "changed" });
+    })).rejects.toThrow();
+    await expect(saved.findMany("user", eq("team", "x"))).rejects.toThrow("no longer active");
+  });
+
+  it("observes existing query mutation targets and preserves staged versions", async () => {
+    const { store } = await fixture();
+    for (const key of ["a", "b"]) await store.create("user", { id: key, team: "x", count: 0 });
+    await store.transaction(async (trx) => {
+      expect(await trx.update("user", eq("team", "x"), { name: "changed" })).toMatchObject({ id: "a" });
+      expect(await trx.incrementOne("user", eq("team", "x"), { count: 1 })).toMatchObject({ count: 1 });
+      expect(await trx.updateMany("user", eq("team", "x"), { team: "y" })).toBe(2);
+      expect(await trx.consumeOne("user", eq("team", "y"))).toMatchObject({ id: "a", count: 1 });
+      expect(await trx.deleteMany("user", eq("team", "y"))).toBe(1);
+    });
+    expect(await store.count("user")).toBe(0);
+  });
+
+  it("maintains uniqueness across staged records and permits atomic ownership transfer", async () => {
+    const { store } = await fixture();
+    await expect(store.transaction(async (trx) => {
+      await trx.create("user", { id: "a", email: "same@example.test" });
+      await trx.create("user", { id: "b", email: "same@example.test" });
+    })).rejects.toThrow("same unique value");
+    expect(await store.count("user")).toBe(0);
+    await store.create("user", { id: "a", email: "a@example.test" });
+    await store.create("user", { id: "b", email: "b@example.test" });
+    await store.transaction(async (trx) => {
+      await trx.update("user", id("a"), { email: "b@example.test" });
+      await trx.update("user", id("b"), { email: "a@example.test" });
+    });
+    expect(await store.findOne("user", eq("email", "b@example.test"))).toMatchObject({ id: "a" });
+    expect(await store.findOne("user", eq("email", "a@example.test"))).toMatchObject({ id: "b" });
+  });
+
+  it("uses the same callback state for nested transactions and atomic bulk mutations", async () => {
+    const { store } = await fixture();
+    await store.transaction(async (trx) => {
+      await trx.create("user", { id: "a", team: "x" });
+      await trx.transaction(async (nested) => { await nested.create("user", { id: "b", team: "x" }); });
+      expect(await trx.updateMany("user", eq("team", "x"), { team: "y" })).toBe(2);
+      expect(await trx.deleteMany("user", eq("team", "y"))).toBe(2);
+      await trx.create("user", { id: "a", team: "z" });
+    });
+    expect(await store.findMany("user")).toEqual([{ id: "a", team: "z" }]);
+  });
+
+  it("requires explicit format initialization", async () => {
+    const db = new MemoryDynamoDB();
+    const store = new DynamoDBStore({ tableName: "auth", client: db.asClient(), transactions: true });
+    await expect(store.create("user", { id: "a" })).rejects.toThrow("initialized transaction storage format");
+    await expect(new DynamoDBStore({ tableName: "auth", client: db.asClient() }).transaction(async () => 1)).rejects.toThrow("not enabled");
+  });
+
+  it("tracks ID IN reads and preserves requested order for staged rows", async () => {
+    const { store } = await fixture();
+    await store.create("user", { id: "a" });
+    await store.transaction(async (trx) => {
+      await trx.create("user", { id: "b" });
+      await trx.create("user", { id: "c" });
+      const where: CleanedWhere[] = [{ field: "id", value: ["c", "a", "b"], operator: "in", mode: "sensitive" }];
+      expect((await trx.findMany<{ id: string }>("user", where)).map((row) => row.id)).toEqual(["c", "a", "b"]);
+      await trx.update("user", id("a"), { name: "updated" });
+      expect((await trx.findMany<{ id: string }>("user", where)).map((row) => row.id)).toEqual(["c", "a", "b"]);
+    });
+  });
+
+  it("keeps ordinary increments, conditional conflicts, and consumes working in transaction mode", async () => {
+    const { store } = await fixture();
+    await store.create("user", { id: "a", email: "same@example.test", count: 0 });
+    await expect(store.create("user", { id: "b", email: "same@example.test" })).rejects.toThrow();
+    expect(await store.incrementOne("user", id("a"), { count: 3 })).toMatchObject({ count: 3 });
+    expect(await store.consumeOne("user", id("a"))).toMatchObject({ count: 3 });
+    expect(await store.findOne("user", id("a"))).toBeNull();
+  });
+
+  it("ordinary writes help clean committed intents and subsequent recovery cannot overwrite them", async () => {
+    const { store, db, options } = await fixture();
+    db.before = (command) => { if (command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("pause cleanup"); };
+    await store.transaction(async (trx) => { await trx.create("user", { id: "a", email: "before@example.test", name: "before" }); });
+    db.before = () => {};
+    await store.update("user", id("a"), { email: "after@example.test", name: "after" });
+    await recoverDynamoDBTransactions(options);
+    expect(await store.findOne("user", id("a"))).toEqual({ id: "a", email: "after@example.test", name: "after" });
+  });
+});
+
+describe("durable commit and recovery", () => {
+
+  it("reports a damaged transaction while recovering unrelated work and validates work limits", async () => {
+    const db = new MemoryDynamoDB();
+    const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+    db.before = (command) => { if (command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("cleanup unavailable"); };
+    await engine.commit(changes(2));
+    const broken = [...db.rows.values()].find((row) => row.state === "COMMITTED")!;
+    const other = changes(2).map((change) => ({ ...change, key: { ...change.key, pk: "MODEL#other" }, after: { ...change.after, pk: "MODEL#other" } }));
+    await engine.commit(other);
+    db.before = (command) => { if (command instanceof GetCommand && command.input.Key?.pk === broken.pk && command.input.Key?.sk === "ROOT") throw new Error("unreadable decision"); };
+    const options = { tableName: "auth", client: db.asClient() };
+    const result = await recoverDynamoDBTransactions(options, undefined, 25, { continueOnError: true });
+    expect(result).toMatchObject({ examined: 2, recovered: 1, failures: [{ transactionId: broken.id, error: expect.any(Error) }] });
+    expect(db.get(other[0]!.key)?.[INTENT]).toBeUndefined();
+    expect(db.get(changes(1)[0]!.key)?.[INTENT]).toBeDefined();
+    await expect(recoverDynamoDBTransactions(options)).rejects.toThrow("unreadable decision");
+    for (const maxBatchesPerTransaction of [0, Infinity, 1.5]) {
+      await expect(recoverDynamoDBTransactions(options, undefined, 25, { maxBatchesPerTransaction })).rejects.toThrow("positive safe integer");
+    }
+    db.before = () => {};
+    await expect(engine.recover("missing")).rejects.toThrow("missing transaction decision");
+    expect((await recoverDynamoDBTransactions(options)).recovered).toBe(1);
+  });
+
+  it("resumes after losing acknowledgement of a cleanup checkpoint", async () => {
+    const db = new MemoryDynamoDB();
+    const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+    let failed = false;
+    db.after = (command) => {
+      if (!failed && command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => String(action.Delete?.Key?.sk).startsWith("E#"))) {
+        failed = true;
+        throw new Error("checkpoint acknowledgement lost");
+      }
+    };
+    await engine.commit(changes(45));
+    expect(failed).toBe(true);
+    expect((await recoverDynamoDBTransactions({ tableName: "auth", client: db.asClient() })).recovered).toBe(1);
+    expect([...db.rows.values()].filter((row) => row.pk === "MODEL#test")).toHaveLength(45);
+    expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
+  });
+
+  it("resumes bounded cleanup across fresh recovery invocations without expiring live journal data", async () => {
+    const db = new MemoryDynamoDB();
+    const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+    db.before = (command) => { if (command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("cleanup unavailable"); };
+    await engine.commit(changes(1_005));
+    const root = [...db.rows.values()].find((row) => row.state === "COMMITTED")!;
+    db.before = () => {};
+    const options = { tableName: "auth", client: db.asClient() };
+    const first = await recoverDynamoDBTransactions(options, undefined, 25, { maxBatchesPerTransaction: 1 });
+    expect(first.recovered).toBe(0);
+    expect(db.get(root)?.ttl).toBeUndefined();
+    expect([...db.rows.values()].some((row) => row[INTENT])).toBe(true);
+    for (let attempt = 0; attempt < 150 && !db.get(root)?.cleaned; attempt++) {
+      await recoverDynamoDBTransactions(options, undefined, 25, { maxBatchesPerTransaction: 1 });
+    }
+    expect(db.get(root)).toMatchObject({ cleaned: true, state: "COMMITTED" });
+    expect(db.get(root)?.ttl).toBeGreaterThan(Date.now() / 1000);
+    expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
+    expect([...db.rows.values()].filter((row) => row.pk === "MODEL#test")).toHaveLength(1_005);
+    expect([...db.rows.values()].filter((row) => row.pk === root.pk)).toHaveLength(1);
+  });
+
+  it.each([false, true])("packs small recovery entries while retaining legacy journals with wrapped size hints=%s", async (wrapped) => {
+    const db = new MemoryDynamoDB();
+    const client = { config: db.config, send: async (command: any) => {
+      const result = await db.send(command);
+      if (wrapped && command instanceof QueryCommand) {
+        for (const row of result.Items ?? []) if (row.restoreBytes !== undefined) row.restoreBytes = NumberValue.from(row.restoreBytes);
+      }
+      return result;
+    } } as unknown as ReturnType<typeof db.asClient>;
+    const engine = new TransactionEngine(new Journal(client, "auth"));
+    db.before = (command) => { if (command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("deferred cleanup"); };
+    await engine.commit(changes(150));
+    const root = [...db.rows.values()].find((row) => row.state === "COMMITTED")!;
+    db.before = () => {};
+    await engine.recover(root.id, 1);
+    expect([...db.rows.values()].filter((row) => row.pk === "MODEL#test" && !row[INTENT])).toHaveLength(99);
+    // Journals written before size hints existed still use conservative bounds.
+    for (const row of db.rows.values()) if (String(row.sk).startsWith("E#")) delete row.restoreBytes;
+    await engine.recover(root.id, 1);
+    expect([...db.rows.values()].filter((row) => row.pk === "MODEL#test" && !row[INTENT])).toHaveLength(121);
+    await engine.recover(root.id);
+    expect(db.get(root)?.cleaned).toBe(true);
+  });
+
+  it("batches recovery reads and tolerates another writer releasing an item during cleanup", async () => {
+    const db = new MemoryDynamoDB();
+    const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+    let raced = false;
+    db.before = (command) => {
+      if (!(command instanceof TransactWriteCommand) || raced) return;
+      const replacement = command.input.TransactItems?.find((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))?.Put?.Item;
+      if (!replacement) return;
+      raced = true;
+      db.put(versioned({ ...replacement, value: "later write" }));
+    };
+    await engine.commit(changes(1_005));
+    expect(raced).toBe(true);
+    expect(db.get({ pk: "MODEL#test", sk: "0" })?.value).toBe("later write");
+    expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
+    expect(db.commands.filter((command) => command instanceof GetCommand).length).toBeLessThan(30);
+  });
+
+  it("helps release committed sidecars before a callback changes their owner record", async () => {
+    const { store, db, options } = await fixture();
+    db.before = (command) => { if (command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("deferred cleanup"); };
+    await store.transaction((trx) => trx.create("user", { id: "a", email: "old@example.test" }));
+    db.before = () => {};
+    await store.transaction((trx) => trx.update("user", id("a"), { email: "new@example.test" }));
+    await recoverDynamoDBTransactions(options);
+    expect(await store.findOne("user", eq("email", "old@example.test"))).toBeNull();
+    expect(await store.findOne("user", eq("email", "new@example.test"))).toMatchObject({ id: "a" });
+  });
+
+  it("finishes recovery after writers race both the first restore batch and its retry", async () => {
+    const db = new MemoryDynamoDB();
+    const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+    let races = 0;
+    db.before = (command) => {
+      if (!(command instanceof TransactWriteCommand) || races === 2) return;
+      const replacement = command.input.TransactItems?.find((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))?.Put?.Item;
+      if (!replacement) return;
+      db.put(versioned({ ...replacement, value: `later-${++races}` }));
+    };
+    await engine.commit(changes(110));
+    expect(races).toBe(2);
+    expect([...db.rows.values()].filter((row) => String(row.value).startsWith("later-"))).toHaveLength(2);
+    expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
+  });
+
+  it("rolls back an interrupted preparation after a complete 99-item batch", async () => {
+    const db = new MemoryDynamoDB();
+    const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+    db.before = (command) => { if (updates(command).some((update) => update.ExpressionAttributeValues?.[":before"] === 99)) throw new Error("interrupted"); };
+    await expect(engine.commit(changes(150))).rejects.toThrow("interrupted");
+    expect([...db.rows.values()].filter((row) => row.pk === "MODEL#test")).toEqual([]);
+    expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
+  });
+
+  it("recognizes a committed transaction after its acknowledgement is lost", async () => {
+    const db = new MemoryDynamoDB();
+    const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+    db.after = (command) => { if (updates(command).some((update) => update.ExpressionAttributeValues?.[":committed"] === "COMMITTED" && update.UpdateExpression === "SET #state = :committed")) throw new Error("lost acknowledgement"); };
+    await engine.commit(changes(105));
+    expect([...db.rows.values()].filter((row) => row.pk === "MODEL#test")).toHaveLength(105);
+  });
+
+  it("keeps committed data readable after cleanup failure and lets a fresh worker recover", async () => {
+    const db = new MemoryDynamoDB();
+    const journal = new Journal(db.asClient(), "auth");
+    const engine = new TransactionEngine(journal);
+    db.before = (command) => { if (command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("cleanup unavailable"); };
+    await engine.commit(changes(105));
+    const raw = db.get({ pk: "MODEL#test", sk: "0" })!;
+    expect(raw[INTENT]).toBeDefined();
+    expect(await engine.resolve(raw, { pk: raw.pk, sk: raw.sk })).toMatchObject({ value: 0 });
+    db.before = () => {};
+    expect(await recoverDynamoDBTransactions({ tableName: "auth", client: db.asClient() })).toMatchObject({ recovered: 1 });
+    expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
+  });
+
+  it("does not report rollback when neither commit nor abort can be acknowledged", async () => {
+    const db = new MemoryDynamoDB();
+    const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+    db.before = (command) => { if (updates(command).some((update) => update.ExpressionAttributeValues?.[":before"] === 99 || update.ExpressionAttributeValues?.[":aborted"] === "ABORTED")) throw new Error("offline"); };
+    await expect(engine.commit(changes(120))).rejects.toBeInstanceOf(DynamoDBTransactionOutcomeUnknownError);
+    const root = [...db.rows.values()].find((row) => row.state === "PREPARING")!;
+    const raw = db.get({ pk: "MODEL#test", sk: "0" })!;
+    expect(await engine.resolve(raw, { pk: raw.pk, sk: raw.sk })).toBeNull();
+    db.before = () => {};
+    db.put({ ...root, expires: 0 });
+    expect(await engine.recover(root.id)).toBe(true);
+    expect(db.get({ pk: "MODEL#test", sk: "0" })).toBeUndefined();
+    expect((await engine.journal.get(rootKey(root.id)))?.state).toBe("ABORTED");
+  });
+
+  it("restores existing records after abort and protects versioned snapshots from ABA writes", async () => {
+    const db = new MemoryDynamoDB();
+    const journal = new Journal(db.asClient(), "auth");
+    const engine = new TransactionEngine(journal);
+    const before = versioned({ pk: "MODEL#test", sk: "a", value: "old" });
+    db.put(before);
+    db.put(versioned({ ...before, value: "old" }));
+    await expect(engine.commit([{ key: { pk: before.pk, sk: before.sk }, before, after: { ...before, value: "new" } }])).rejects.toThrow("ConditionalCheckFailed");
+    expect(db.get(before)).toMatchObject({ value: "old" });
+    expect(db.get(before)?.[PHYSICAL_VERSION]).not.toBe(before[PHYSICAL_VERSION]);
+    await expect(engine.commit([...changes(1), ...changes(1)])).rejects.toThrow("duplicate physical keys");
+    expect(keyId({ pk: "a\u0000b", sk: "c" })).not.toBe(keyId({ pk: "a", sk: "b\u0000c" }));
+  });
+});
+
+it("journals binary, sets, large numbers and large payloads without JSON type loss", () => {
+  const codec = new JournalCodec();
+  const input = { text: "x".repeat(280_000), binary: Buffer.from([0, 1, 255]), binaries: new Set([Buffer.from([1]), Buffer.from([2])]), numbers: new Set([1, 2]), strings: new Set(["a", "b"]), huge: 9007199254740993n, B: "ordinary attribute", BS: ["ordinary"] };
+  const parts = codec.encode(input);
+  expect(parts.length).toBeGreaterThan(1);
+  expect(codec.decode(parts)).toEqual(input);
+  expect(codec.decode(codec.encode(null))).toBeNull();
+});
+
+it("keeps the durable journal format stable when DocumentClient mutates its translation options", () => {
+  const marshal = { convertTopLevelContainer: false, removeUndefinedValues: true };
+  const unmarshal = { convertWithoutMapWrapper: false };
+  const codec = new JournalCodec(marshal, unmarshal);
+  const item = { pk: "MODEL#test", sk: "a", nested: { value: "ok", absent: undefined } };
+  const before = codec.encode(item);
+  marshal.convertTopLevelContainer = true;
+  unmarshal.convertWithoutMapWrapper = true;
+  expect(codec.decode(before)).toEqual({ pk: item.pk, sk: item.sk, nested: { value: "ok" } });
+  expect(codec.decode(codec.encode(item))).toEqual(codec.decode(before));
+});
+
+it("rejects oversized final items before preparing or publishing a transaction", async () => {
+  const db = new MemoryDynamoDB();
+  const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+  const [change] = changes(1);
+  await expect(engine.commit([{ ...change!, after: { ...change!.after, text: "é".repeat(210_000) } }])).rejects.toThrow("400 KiB");
+  expect(db.rows.size).toBe(0);
+  const codec = engine.journal.codec;
+  expect(codec.validate({ text: "ok", binary: Buffer.from([1, 2]), yes: true, empty: null, number: 3, list: ["a", { b: true }], ss: new Set(["ab"]), ns: new Set([4]), bs: new Set([Buffer.from([3])]) })).toBeGreaterThan(60);
+  expect(codec.validate(null)).toBe(0);
+  await engine.commit([{ ...change!, after: { ...change!.after, text: "x".repeat(390_000) } }]);
+  expect(db.get(change!.key)?.text).toHaveLength(390_000);
+  expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
+});
