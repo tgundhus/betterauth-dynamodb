@@ -1,6 +1,6 @@
 # DynamoDB-only enterprise transactions
 
-Status: implemented as an opt-in, unpublished 2.0 preview. Version 1.2 continues to report `transaction: false`. The preview is isolated on `feat/enterprise-transactions`; it is not a production release.
+Status: implemented as an opt-in, unpublished 2.0 preview on `main`. Stable version 1.2 remains on `release/1.2` and continues to report `transaction: false`. The preview is not a production release.
 
 ## Implemented and verified
 

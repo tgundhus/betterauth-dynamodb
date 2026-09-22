@@ -27,7 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Recovery can be bounded across Lambda invocations, retains durable cleanup progress, and reports damaged transactions without blocking unrelated maintenance. A scheduled worker and AWS SAM deployment example are included.
 - A transient storage-format read failure no longer leaves the adapter permanently unavailable. A later request retries initialization on the same adapter instance.
 
-This is an unpublished preview. Real AWS load, conflict/recovery testing, and migration rehearsals remain required before production release. Stable 1.2 behavior remains available on `main`.
+This is an unpublished preview. Real AWS load, conflict/recovery testing, and migration rehearsals remain required before production release. Stable 1.2 behavior remains available on `release/1.2`.
 
 ## [1.2.0] - 2026-09-21
 
@@ -89,7 +89,7 @@ This is an unpublished preview. Real AWS load, conflict/recovery testing, and mi
 - Defines the 1.0 storage layout contract for entity rows, scalar equality sidecar rows, unique lock rows, delimiter-safe length-prefixed key components, hashed sidecar/lock values, and hidden revision metadata.
 - Includes unit coverage, DynamoDB Local integration tests, Better Auth adapter conformance suites, coverage thresholds, and a per-production-function CRAP `<= 6` quality gate through `bun run verify`.
 
-[1.2.0]: https://github.com/tgundhus/betterauth-dynamodb/compare/v1.1.0...main
+[1.2.0]: https://github.com/tgundhus/betterauth-dynamodb/compare/v1.1.0...release/1.2
 [1.1.0]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/bjorntech/betterauth-dynamodb/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/bjorntech/betterauth-dynamodb/releases/tag/v1.0.0

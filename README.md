@@ -6,10 +6,10 @@ This project is an independently maintained continuation of [BjornTech's Better 
 
 ## Project status
 
-| Version                                           | Status  | Purpose                                                                                                                    |
-| ------------------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `1.2` on `main`                                   | Stable  | Backwards-compatible performance and stability improvements over BjornTech `1.1`. No storage migration is required.        |
-| `2.0.0-alpha.0` on `feat/enterprise-transactions` | Preview | DynamoDB-backed callback transactions for SCIM and advanced SSO. A coordinated migration and recovery worker are required. |
+| Version                   | Status  | Purpose                                                                                                                    |
+| ------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `1.2` on `release/1.2`    | Stable  | Backwards-compatible performance and stability improvements over BjornTech `1.1`. No storage migration is required.        |
+| `2.0.0-alpha.0` on `main` | Preview | DynamoDB-backed callback transactions for SCIM and advanced SSO. A coordinated migration and recovery worker are required. |
 
 The transaction preview has extensive unit and DynamoDB Local coverage. AWS load, recovery, migration, and rollback rehearsals remain release requirements before production adoption.
 
@@ -40,7 +40,7 @@ Build a reproducible archive from a pinned commit:
 ```sh
 git clone https://github.com/tgundhus/betterauth-dynamodb.git
 cd betterauth-dynamodb
-git checkout feat/enterprise-transactions
+git checkout main
 bun install --frozen-lockfile
 bun run build
 npm pack --ignore-scripts
@@ -52,7 +52,7 @@ Install the generated archive with Better Auth:
 npm install /path/to/bjorntech-betterauth-dynamodb-2.0.0-alpha.0.tgz better-auth@1.7.5
 ```
 
-Retain the archive with your deployment artifacts so every environment uses the same build.
+Record the checked-out commit and retain the archive with your deployment artifacts so every environment uses the same build.
 
 ## Basic usage
 
