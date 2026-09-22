@@ -10,7 +10,7 @@ The integration contracts cover SCIM provisioning, group membership, role projec
 
 The companion SCIM source changes start at Better Auth tag `v1.7.5`, commit `5468e6bfcdff799848537cf5ad06ebab15aad9dd`. They add optional `groups.maxMembers` and `bulk` configuration, complete internal membership pagination, chunked user lookups, and per-resource Bulk dispatch. The SCIM suite passes 344 tests and the full Better Auth workspace typecheck passes. A combined adapter/plugin contract passes with 1,051 Bulk-created users and a 1,051-member group through create, complete reads, replacement, PATCH, and deletion. That scale run uses the independent DynamoDB command double; it is not an AWS performance benchmark. The companion package is not published; installing `@better-auth/scim@1.7.5` does not enable them.
 
-The companion changes are available in [Better Auth continuation PR #1](https://github.com/tgundhus/better-auth/pull/1). Adapter CI pins revision `8f718a7478c1d49c7864685b0892684f535123dd`, builds that SCIM package, runs its tests, and exercises the combined scale contract against DynamoDB Local. See the CI result before treating a new revision as validated.
+The companion changes are available in [Better Auth continuation PR #1](https://github.com/tgundhus/better-auth/pull/1). Adapter CI pins revision `f936252eb5118fc9147297df57840f52c75cf078`, builds that SCIM package, runs its tests, and exercises the combined scale contract against DynamoDB Local. The pin includes user-indexed grant removal so group deletion does not repeatedly read every grant in the provisioning domain. See the CI result before treating a new revision as validated.
 
 ```ts
 scim({
