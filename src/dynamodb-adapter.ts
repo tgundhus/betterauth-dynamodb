@@ -25,6 +25,7 @@ const MAX_BATCH_GET_ITEMS = 100;
 
 export class DynamoDBStore {
   private readonly client: DynamoDBDocumentClient;
+  private readonly queryClient: DynamoDBDocumentClient;
   private readonly options: ReturnType<typeof normalizeOptions<DynamoDBStoreOptions>>;
   private readonly engine: TransactionEngine | undefined;
   private readonly context: CallbackContext | undefined;
@@ -36,6 +37,8 @@ export class DynamoDBStore {
     this.context = options.transactionContext;
     const client = this.engine && !options.transactionEngine ? participatingClient(raw, this.engine) : raw;
     this.client = this.context ? this.context.client(client) : client;
+    // Query candidates become dependencies only after filtering and windowing.
+    this.queryClient = this.context ? this.context.client(client, false) : client;
   }
 
   async transaction<R>(callback: (store: DynamoDBStore) => Promise<R>): Promise<R> {
@@ -65,13 +68,17 @@ export class DynamoDBStore {
   async findMany<T>(model: string, where: CleanedWhere[] = [], limit = 100, offset = 0, sortBy?: { field: string; direction: "asc" | "desc" }, select?: string[]): Promise<T[]> {
     const plan = planQuery(where, this.options.unsafeAllowScan);
     const rows = await this.loadRows(model, plan, sortBy ? undefined : readWindowSize(limit, offset));
-    return selectWindow(rows.filter((row) => matchesWhere(row, where)), limit, offset, sortBy, this.options.ttl, select) as T[];
+    const window = selectWindow(rows.filter((row) => matchesWhere(row, where)), limit, offset, sortBy, this.options.ttl);
+    this.context?.observeRows(window.map(({ row }) => row));
+    return window.map(({ record }) => projectRecord(record, select)) as T[];
   }
 
   async count(model: string, where: CleanedWhere[] = []): Promise<number> {
     const plan = planQuery(where, this.options.unsafeAllowScan);
     const rows = await this.loadRows(model, plan);
-    return rows.filter((row) => matchesWhere(row, where)).length;
+    const matches = rows.filter((row) => matchesWhere(row, where));
+    this.context?.observeRows(matches);
+    return matches.length;
   }
 
   async update<T>(model: string, where: CleanedWhere[], update: Record<string, unknown>): Promise<T | null> {
@@ -139,12 +146,16 @@ export class DynamoDBStore {
 
   private async targetByWhere(model: string, where: CleanedWhere[]): Promise<StoredItem | null> {
     const rows = await this.loadRows(model, planQuery(where, this.options.unsafeAllowScan));
-    return rows.find((row) => matchesWhere(row, where)) ?? null;
+    const target = rows.find((row) => matchesWhere(row, where)) ?? null;
+    this.context?.observeRows(target ? [target] : []);
+    return target;
   }
 
   private async matchingTargets(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
     const rows = await this.loadRows(model, planQuery(where, this.options.unsafeAllowScan));
-    return rows.filter((row) => matchesWhere(row, where));
+    const targets = rows.filter((row) => matchesWhere(row, where));
+    this.context?.observeRows(targets);
+    return targets;
   }
 
   private async writeMany(rows: readonly (readonly [StoredItem, Record<string, unknown>])[], model: string): Promise<number> {
@@ -195,7 +206,7 @@ export class DynamoDBStore {
 
   private async queryWindow<T>(command: QueryCommandInput, where: CleanedWhere[], take: number, hydrate: (items: T[]) => Promise<StoredItem[]>): Promise<StoredItem[]> {
     return drainPages<StoredItem>(async (key) => {
-      const page = await this.client.send(new QueryCommand({ ...command, ExclusiveStartKey: key }));
+      const page = await this.queryClient.send(new QueryCommand({ ...command, ExclusiveStartKey: key }));
       const owners = await hydrate((page.Items ?? []) as T[]);
       const rows = visibleRows(owners, this.options.ttl).filter((row) => matchesWhere(row, where));
       return { ...pageOf<StoredItem>(page), Items: rows };
@@ -253,30 +264,30 @@ export class DynamoDBStore {
 
   private async queryAllSidecars(model: string, clause: CleanedWhere, budget?: { remaining: number }): Promise<SidecarItem[]> {
     const command = sidecarQuery(this.options.tableName, model, clause, this.options.consistentRead, this.options.pageSize);
-    return drainPages<SidecarItem>(async (key) => pageOf<SidecarItem>(await this.client.send(new QueryCommand({ ...command, ExclusiveStartKey: key }))), this.options.maxPages, budget);
+    return drainPages<SidecarItem>(async (key) => pageOf<SidecarItem>(await this.queryClient.send(new QueryCommand({ ...command, ExclusiveStartKey: key }))), this.options.maxPages, budget);
   }
 
   private async queryAllModel(model: string): Promise<StoredItem[]> {
     const command = modelQuery(this.options.tableName, model, this.options.consistentRead, this.options.pageSize);
-    return drainPages<StoredItem>(async (key) => pageOf<StoredItem>(await this.client.send(new QueryCommand({ ...command, ExclusiveStartKey: key }))), this.options.maxPages);
+    return drainPages<StoredItem>(async (key) => pageOf<StoredItem>(await this.queryClient.send(new QueryCommand({ ...command, ExclusiveStartKey: key }))), this.options.maxPages);
   }
 
   private async loadOwners(sidecars: SidecarItem[], clause: CleanedWhere): Promise<StoredItem[]> {
     const keys = sidecars.flatMap(ownerKeyOf);
-    const rows = await this.batchGetRows(keys);
+    const rows = await this.batchGetRows(keys, this.queryClient);
     return rows.filter((row) => matchesWhere(row, [clause]));
   }
 
-  private async batchGetRows(keys: { pk: string; sk: string }[]): Promise<StoredItem[]> {
+  private async batchGetRows(keys: { pk: string; sk: string }[], client = this.client): Promise<StoredItem[]> {
     const uniqueKeys = [...new Map(keys.map((key) => [keyString(key), key])).values()];
     const batches = chunk(uniqueKeys, MAX_BATCH_GET_ITEMS);
-    const rows = await mapBounded(batches, this.options.maxBulkConcurrency, (batch) => this.batchGet(batch));
+    const rows = await mapBounded(batches, this.options.maxBulkConcurrency, (batch) => this.batchGet(batch, client));
     const rowsByKey = new Map(rows.flat().map((row) => [keyString(row), row]));
     return visibleRows(uniqueKeys.flatMap((key) => rowsByKey.get(keyString(key)) ?? []), this.options.ttl);
   }
 
-  private async batchGet(keys: { pk: string; sk: string }[]): Promise<StoredItem[]> {
-    return batchGetAttempts(this.client, this.options.tableName, keys, this.options.consistentRead);
+  private async batchGet(keys: { pk: string; sk: string }[], client: DynamoDBDocumentClient): Promise<StoredItem[]> {
+    return batchGetAttempts(client, this.options.tableName, keys, this.options.consistentRead);
   }
 
   private sidecars(model: string, data: Record<string, unknown>): SidecarItem[] {
@@ -339,13 +350,13 @@ function readWindowSize(limit: number, offset: number): number | undefined {
   return Number.isSafeInteger(offset + limit) ? offset + limit : undefined;
 }
 
-function selectWindow(rows: StoredItem[], limit: number, offset: number, sortBy?: { field: string; direction: "asc" | "desc" }, ttl?: false | TtlOptions, select?: string[]): Record<string, unknown>[] {
+function selectWindow(rows: StoredItem[], limit: number, offset: number, sortBy?: { field: string; direction: "asc" | "desc" }, ttl?: false | TtlOptions): { row: StoredItem; record: Record<string, unknown> }[] {
   const sorted = sortBy ? [...rows].sort((a, b) => compareSort(a, b, sortBy)) : rows;
   const records = sorted.flatMap((row) => {
     const record = fromStoredItem<Record<string, unknown>>(row, ttl);
-    return record ? [record] : [];
+    return record ? [{ row, record }] : [];
   });
-  return records.slice(offset, offset + limit).map((row) => projectRecord(row, select));
+  return records.slice(offset, offset + limit);
 }
 
 function projectRecord(row: Record<string, unknown>, select?: string[]): Record<string, unknown> {

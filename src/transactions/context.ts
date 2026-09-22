@@ -1,4 +1,4 @@
-import { BatchGetCommand, GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
+import { BatchGetCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBConflictError } from "../errors.js";
 import { REVISION_ATTRIBUTE } from "../serialize.js";
@@ -18,11 +18,12 @@ export class CallbackContext {
 
   constructor(readonly engine: TransactionEngine, private readonly sidecars: (item: StoredItem) => SidecarItem[]) {}
 
-  client(base: DynamoDBDocumentClient): DynamoDBDocumentClient {
+  client(base: DynamoDBDocumentClient, observeReads = true): DynamoDBDocumentClient {
     const send = async (command: any) => {
       this.assertOpen();
       const result = await base.send(command);
-      this.recordResponse(command, result);
+      this.assertOpen();
+      if (observeReads) this.recordResponse(command, result);
       return result;
     };
     return new Proxy(base, { get: (target, property) => property === "send" ? send : Reflect.get(target, property) });
@@ -30,11 +31,14 @@ export class CallbackContext {
 
   private recordResponse(command: any, result: any): void {
     if (command instanceof GetCommand) this.observe(command.input.Key as Key, result.Item ?? null);
-    if (command instanceof QueryCommand) this.recordQuery(result.Items ?? []);
     if (command instanceof BatchGetCommand) this.recordBatch(command, result);
   }
 
-  private recordQuery(items: StoredItem[]): void { for (const row of items) this.observe(keyOf(row), row); }
+  observeRows(items: StoredItem[]): void {
+    this.assertOpen();
+    // Staged versions already retain the original read/absence dependency.
+    for (const row of items) if (!this.writes.has(keyId(row))) this.observe(keyOf(row), row);
+  }
 
   private recordBatch(command: BatchGetCommand, result: any): void {
     for (const [table, request] of Object.entries(command.input.RequestItems ?? {})) {

@@ -23,6 +23,8 @@ The 2.0 preview adds `transactions: true`, storage initialization, and a recover
 
 String sorting in the preview uses ordinal JavaScript string comparisons, consistent with its range filters. This fixes skipped records in cursor pagination over mixed-case IDs. Applications that depended on locale-aware ordering should apply their presentation collation separately.
 
+Callback queries journal returned records and mutation targets after filtering and pagination, avoiding dependencies on discarded candidates. Point-read absence remains protected. Query predicates do not acquire serializable range locks; see [transaction isolation](./docs/transaction-storage.md#commit-and-recovery).
+
 ## Installation
 
 This continuation is currently distributed from this repository. The package still uses the name `@bjorntech/betterauth-dynamodb` for compatibility, so installing that name from npm retrieves BjornTech's published package rather than this continuation.

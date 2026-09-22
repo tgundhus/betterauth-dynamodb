@@ -108,6 +108,84 @@ describe("DynamoDB callback transactions", () => {
     expect(await store.findOne("session", id("s2"))).toBeNull();
   });
 
+  it.each(["indexed", "model", "in"])("protects only the returned window of a %s query", async (kind) => {
+    const { store, db } = await fixture();
+    for (const key of ["a", "b", "c"]) await store.create("user", { id: key, team: "x" });
+    const where: CleanedWhere[] = kind === "model" ? [] : kind === "in" ? [{ field: "team", value: ["x"], operator: "in", mode: "sensitive" }] : eq("team", "x");
+    await store.transaction(async (trx) => {
+      expect(await trx.findMany("user", where, 1, 1, { field: "id", direction: "asc" }, ["id"])).toEqual([{ id: "b" }]);
+      await store.update("user", id("a"), { name: "concurrent before window" });
+      await store.update("user", id("c"), { name: "concurrent after window" });
+    });
+    const decision = [...db.rows.values()].find((row) => row.state === "COMMITTED");
+    expect(decision).toMatchObject({ count: 1, cleaned: true });
+    await expect(store.transaction(async (trx) => {
+      await trx.findMany("user", where, 1, 1, { field: "id", direction: "asc" });
+      await store.update("user", id("b"), { name: "selected row changed" });
+    })).rejects.toThrow();
+  });
+
+  it("does not journal candidates rejected by residual filters, but protects counted records", async () => {
+    const { store, db } = await fixture();
+    await store.create("user", { id: "a", team: "x", name: "selected" });
+    await store.create("user", { id: "b", team: "x", name: "ignored" });
+    const where: CleanedWhere[] = [...eq("team", "x"), { field: "name", value: "select", operator: "starts_with", mode: "sensitive" }];
+    await store.transaction(async (trx) => {
+      expect(await trx.count("user", where)).toBe(1);
+      expect(await trx.findOne("user", where)).toMatchObject({ id: "a" });
+      await store.update("user", id("b"), { name: "still ignored" });
+    });
+    expect([...db.rows.values()].find((row) => row.state === "COMMITTED")).toMatchObject({ count: 1 });
+    await expect(store.transaction(async (trx) => {
+      expect(await trx.count("user", where)).toBe(1);
+      await store.update("user", id("a"), { name: "concurrently changed" });
+    })).rejects.toThrow();
+  });
+
+  it("retains point-read absence in ID IN while filtering query candidates", async () => {
+    const { store } = await fixture();
+    await expect(store.transaction(async (trx) => {
+      expect(await trx.findMany("user", [{ field: "id", value: ["missing"], operator: "in", mode: "sensitive" }])).toEqual([]);
+      await store.create("user", { id: "missing" });
+    })).rejects.toThrow();
+  });
+
+  it("poisons a callback after a repeated selected query observes a changed version", async () => {
+    const { store } = await fixture();
+    await store.create("user", { id: "a", team: "x" });
+    await expect(store.transaction(async (trx) => {
+      await trx.findOne("user", eq("team", "x"));
+      await store.update("user", id("a"), { name: "changed" });
+      await expect(trx.findOne("user", eq("team", "x"))).rejects.toThrow("concurrent change");
+    })).rejects.toThrow("concurrent change");
+  });
+
+  it("retains dependencies from concurrent queries and guards query lifetime", async () => {
+    const { store } = await fixture();
+    let saved!: DynamoDBStore;
+    for (const key of ["a", "b"]) await store.create("user", { id: key, team: "x" });
+    await expect(store.transaction(async (trx) => {
+      saved = trx;
+      const results = await Promise.all([0, 1].map((offset) => trx.findMany("user", eq("team", "x"), 1, offset, { field: "id", direction: "asc" })));
+      expect(results).toEqual([[{ id: "a", team: "x" }], [{ id: "b", team: "x" }]]);
+      await store.update("user", id("a"), { name: "changed" });
+    })).rejects.toThrow();
+    await expect(saved.findMany("user", eq("team", "x"))).rejects.toThrow("no longer active");
+  });
+
+  it("observes existing query mutation targets and preserves staged versions", async () => {
+    const { store } = await fixture();
+    for (const key of ["a", "b"]) await store.create("user", { id: key, team: "x", count: 0 });
+    await store.transaction(async (trx) => {
+      expect(await trx.update("user", eq("team", "x"), { name: "changed" })).toMatchObject({ id: "a" });
+      expect(await trx.incrementOne("user", eq("team", "x"), { count: 1 })).toMatchObject({ count: 1 });
+      expect(await trx.updateMany("user", eq("team", "x"), { team: "y" })).toBe(2);
+      expect(await trx.consumeOne("user", eq("team", "y"))).toMatchObject({ id: "a", count: 1 });
+      expect(await trx.deleteMany("user", eq("team", "y"))).toBe(1);
+    });
+    expect(await store.count("user")).toBe(0);
+  });
+
   it("maintains uniqueness across staged records and permits atomic ownership transfer", async () => {
     const { store } = await fixture();
     await expect(store.transaction(async (trx) => {

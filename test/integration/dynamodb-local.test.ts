@@ -106,6 +106,34 @@ describe("DynamoDB Local adapter integration", () => {
     expect((await rawRow(modelPk("member"), entitySk("member-0")))?.[INTENT]).toBeUndefined();
   });
 
+  it("journals only selected query records while retaining conflicts on selected records", async () => {
+    const manifests: number[] = [];
+    const client = { config: docClient.config, send: async (command: any) => {
+      if (command instanceof TransactWriteCommand) {
+        for (const action of command.input.TransactItems ?? []) {
+          if (action.Put?.Item?.state === "PREPARING") manifests.push(Number(action.Put.Item.count));
+        }
+      }
+      return docClient.send(command);
+    } } as unknown as DynamoDBDocumentClient;
+    const options = { tableName, client, transactions: true, pageSize: 2, unsafeAllowScan: true };
+    await initializeDynamoDBTransactions(options);
+    const store = new DynamoDBStore(options);
+    for (const key of ["a", "b", "c", "d"]) await store.create("user", { id: key, team: "x" });
+    for (const where of [[eq("team", "x")], [inValues("team", ["x"])], []]) {
+      await store.transaction(async (trx) => {
+        expect(await trx.findMany("user", where, 1, 1, { field: "id", direction: "asc" }, ["id"])).toEqual([{ id: "b" }]);
+        await store.update("user", [eq("id", "c")], { name: randomUUID() });
+      });
+      expect(manifests.at(-1)).toBe(1);
+    }
+    await expect(store.transaction(async (trx) => {
+      await trx.findMany("user", [eq("team", "x")], 1, 1, { field: "id", direction: "asc" });
+      await store.update("user", [eq("id", "b")], { name: "concurrent" });
+    })).rejects.toThrow();
+    expect(await store.findOne("user", [eq("id", "b")])).toMatchObject({ name: "concurrent" });
+  });
+
   it("restores every prepared item when a later callback prepare batch fails", async () => {
     const broken = { send: async (command: any) => {
       if (command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Update?.ExpressionAttributeValues?.[":before"] === 99)) throw new Error("injected prepare failure");
