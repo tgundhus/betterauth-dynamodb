@@ -1,4 +1,4 @@
-import { TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { GetCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { describe, expect, it } from "vitest";
 import { DynamoDBStore } from "../src/dynamodb-adapter.js";
 import { initializeDynamoDBTransactions, recoverDynamoDBTransactions } from "../src/transactions/maintenance.js";
@@ -141,6 +141,36 @@ describe("DynamoDB callback transactions", () => {
 });
 
 describe("durable commit and recovery", () => {
+
+  it("batches recovery reads and tolerates another writer releasing an item during cleanup", async () => {
+    const db = new MemoryDynamoDB();
+    const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+    let raced = false;
+    db.before = (command) => {
+      if (!(command instanceof TransactWriteCommand) || raced) return;
+      const replacement = command.input.TransactItems?.find((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))?.Put?.Item;
+      if (!replacement) return;
+      raced = true;
+      db.put(versioned({ ...replacement, value: "later write" }));
+    };
+    await engine.commit(changes(1_005));
+    expect(raced).toBe(true);
+    expect(db.get({ pk: "MODEL#test", sk: "0" })?.value).toBe("later write");
+    expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
+    expect(db.commands.filter((command) => command instanceof GetCommand).length).toBeLessThan(30);
+  });
+
+  it("helps release committed sidecars before a callback changes their owner record", async () => {
+    const { store, db, options } = await fixture();
+    db.before = (command) => { if (command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("deferred cleanup"); };
+    await store.transaction((trx) => trx.create("user", { id: "a", email: "old@example.test" }));
+    db.before = () => {};
+    await store.transaction((trx) => trx.update("user", id("a"), { email: "new@example.test" }));
+    await recoverDynamoDBTransactions(options);
+    expect(await store.findOne("user", eq("email", "old@example.test"))).toBeNull();
+    expect(await store.findOne("user", eq("email", "new@example.test"))).toMatchObject({ id: "a" });
+  });
+
   it("rolls back an interrupted preparation after a complete 99-item batch", async () => {
     const db = new MemoryDynamoDB();
     const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));

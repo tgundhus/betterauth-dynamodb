@@ -18,6 +18,7 @@ export class TransactionEngine {
     if (input.length === 0) return;
     const changes = validateChanges(input);
     for (const change of changes) this.journal.codec.validate(change.after);
+    await this.releaseIncomingIntents(changes);
     const id = randomUUID();
     await this.journal.start(id, changes.length);
     try {
@@ -33,6 +34,11 @@ export class TransactionEngine {
     // A cleanup failure cannot turn an already committed callback into a rollback.
     // The durable registry retains it for the application's recovery worker.
     await this.tryRecover(id);
+  }
+
+  private async releaseIncomingIntents(changes: Change[]): Promise<void> {
+    const rows = await this.journal.getMany(changes.map((change) => change.key));
+    for (const change of changes) if (intentOf(rows.get(keyId(change.key)) ?? null)) await this.release(change.key);
   }
 
   private async prepare(id: string, changes: Change[]): Promise<void> {

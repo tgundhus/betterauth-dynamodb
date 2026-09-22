@@ -19,6 +19,7 @@ import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 import { compoundUniqueIndexName, compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../../src/serialize.js";
 import { enterpriseContract } from "../helpers/enterprise-contract.js";
+import { ssoContract, ssoGuardContract } from "../helpers/sso-contract.js";
 
 const IMAGE = "amazon/dynamodb-local:2.6.1";
 const REGION = "us-east-1";
@@ -105,6 +106,14 @@ describe("DynamoDB Local adapter integration", () => {
 
   it("runs published SCIM provisioning and projection rollback entirely on DynamoDB", async () => {
     await enterpriseContract({ tableName, client: docClient });
+  });
+
+  it("runs SSO resolution, rollback and SCIM session revocation entirely on DynamoDB", async () => {
+    await ssoContract({ tableName, client: docClient });
+  });
+
+  it("rolls back rejected provider guards and commits allowed provider mutations on DynamoDB", async () => {
+    await ssoGuardContract({ tableName, client: docClient });
   });
 
   it("maintains multiple scalar plugin-like equality sidecars in one table", async () => {
