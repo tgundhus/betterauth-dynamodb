@@ -16,6 +16,8 @@ The local integration suite requires Docker. It uses Testcontainers with AWS's o
 
 The transaction preview also runs the published SCIM and SSO plugins through their HTTP routes in this suite. `test/preview/scim-large.test.ts` is a separate cross-package contract for a built SCIM continuation containing large-group and Bulk support. Set `SCIM_PREVIEW_MODULE` to that module, then run `bunx vitest run --config vitest.preview.config.ts`. The published SCIM 1.7.5 package cannot run that contract. By default this command uses an independent DynamoDB command double. Set `SCIM_PREVIEW_DYNAMODB=1` to run the same contract in an isolated DynamoDB Local container with Docker. Neither replaces real AWS load and failure validation.
 
+The `enterprise-scale` CI job builds the companion SCIM continuation from an immutable commit in `tgundhus/better-auth`. Update the pin deliberately when reviewing companion changes. The job runs on pull requests and `main` to avoid duplicate scale runs for each feature-branch push.
+
 Useful focused commands:
 
 - `bun run typecheck`

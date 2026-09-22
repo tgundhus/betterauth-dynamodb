@@ -10,6 +10,8 @@ The integration contracts cover SCIM provisioning, group membership, role projec
 
 The companion SCIM source changes start at Better Auth tag `v1.7.5`, commit `5468e6bfcdff799848537cf5ad06ebab15aad9dd`. They add optional `groups.maxMembers` and `bulk` configuration, complete internal membership pagination, chunked user lookups, and per-resource Bulk dispatch. The SCIM suite passes 344 tests and the full Better Auth workspace typecheck passes. A combined adapter/plugin contract passes with 1,051 Bulk-created users and a 1,051-member group through create, complete reads, replacement, PATCH, and deletion. That scale run uses the independent DynamoDB command double; it is not an AWS performance benchmark. The companion package is not published; installing `@better-auth/scim@1.7.5` does not enable them.
 
+The companion changes are available in [Better Auth continuation PR #1](https://github.com/tgundhus/better-auth/pull/1). Adapter CI pins revision `8f718a7478c1d49c7864685b0892684f535123dd`, builds that SCIM package, runs its tests, and exercises the combined scale contract against DynamoDB Local. See the CI result before treating a new revision as validated.
+
 ```ts
 scim({
   connections: [connection],
@@ -123,7 +125,7 @@ Run the repository's full verification and DynamoDB Local integration suites. Lo
 
 ## Remaining release work
 
-1. Publish a reviewable, pinned companion SCIM source revision and run the combined large-group/Bulk contract against DynamoDB Local, including role projection and decommissioning at scale.
+1. Pass the combined large-group/Bulk contract against DynamoDB Local, including role projection, and expand coverage to decommissioning at scale.
 2. Expand concurrent SCIM deactivation, group mutation, and sign-in tests to validate the plugin's revision fences under the adapter's optimistic conflicts. Query predicates do not receive SQL-style range locks.
 3. Run 10,000-member workloads and real AWS fault/load tests, measuring latency, requests, consumed capacity, bytes, contention, and cleanup cost. Configure runtime and proxy limits using those measurements.
 4. Rehearse migration, backup/restore, recovery, and rollback with all readers/writers coordinated. Validate any stream consumers separately.

@@ -12,7 +12,14 @@ it("provisions 1,051 users through Bulk and preserves every large-group member",
   onTestFinished(database.close);
   const options = database.options;
   await initializeDynamoDBTransactions(options);
-  const auth = betterAuth({ baseURL: "http://localhost:3000", secret: "large-group-test-secret-at-least-32-characters", database: dynamoDBAdapter(options), plugins: [scim({ groups: { maxMembers: null }, bulk: {}, connections: [{ id: "workforce", credentials: [{ type: "bearer", id: "test", token: "test" }] }] })] });
+  const auth = betterAuth({ baseURL: "http://localhost:3000", secret: "large-group-test-secret-at-least-32-characters", database: dynamoDBAdapter(options), user: { additionalFields: { enterpriseRole: { type: "string", required: false } } }, plugins: [scim({ groups: { maxMembers: null }, bulk: {}, connections: [{ id: "workforce", credentials: [{ type: "bearer", id: "test", token: "test" }] }], projection: {
+    roles: { map: () => ["member"], exists: () => true },
+    reconcileUser: async (input: { userId: string; active: boolean; grants: unknown[] }, context: { database: { update: (input: unknown) => Promise<unknown> } }) => {
+      await context.database.update({ model: "user", where: [{ field: "id", value: input.userId }], update: { enterpriseRole: input.active && input.grants.length ? "member" : "none" } });
+    }
+  } })] });
+  const adapter = (await auth.$context).adapter;
+  const projectedUsers = () => adapter.count({ model: "user", where: [{ field: "enterpriseRole", value: "member" }] });
   const request = async (path: string, method: string, body?: unknown) => {
     const response = await auth.handler(new Request(`http://localhost:3000/api/auth/scim/v2${path}`, { method, headers: { authorization: "Bearer test", "content-type": "application/scim+json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
     const data = response.status === 204 ? null : await response.json() as any;
@@ -27,17 +34,20 @@ it("provisions 1,051 users through Bulk and preserves every large-group member",
   const schema = "urn:ietf:params:scim:schemas:core:2.0:Group";
   const group = await request("/Groups", "POST", { schemas: [schema], displayName: "Large group", members });
   expect(group.members).toHaveLength(1_051);
+  expect(await projectedUsers()).toBe(1_051);
   console.info("Group: 1,051 members committed");
   expect((await request(`/Groups/${group.id}`, "GET")).members).toHaveLength(1_051);
   expect((await request("/Groups", "GET")).Resources[0].members).toHaveLength(1_051);
   console.info("Group: complete point and collection reads verified");
   const replaced = await request(`/Groups/${group.id}`, "PUT", { schemas: [schema], displayName: "Replaced", members: members.slice(10) });
   expect(replaced.members).toHaveLength(1_041);
+  expect(await projectedUsers()).toBe(1_041);
   console.info("Group: membership replacement verified");
   const patched = await request(`/Groups/${group.id}`, "PATCH", { schemas: ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], Operations: [{ op: "add", path: "members", value: members.slice(0, 10) }] });
   expect(patched.members).toHaveLength(1_051);
+  expect(await projectedUsers()).toBe(1_051);
   console.info("Group: membership PATCH verified");
   await request(`/Groups/${group.id}`, "DELETE");
-  const adapter = (await auth.$context).adapter;
+  expect(await projectedUsers()).toBe(0);
   expect(await adapter.count({ model: "scimGroupMember", where: [{ field: "connectionId", value: "workforce" }] })).toBe(0);
 }, 600_000);

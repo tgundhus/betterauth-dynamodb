@@ -23,3 +23,44 @@ jobs:
       - run: docker version
       - run: docker pull amazon/dynamodb-local:2.6.1
       - run: bun run test:integration:local
+  enterprise-scale:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.5
+      - run: bun install --frozen-lockfile
+      - uses: actions/checkout@v4
+        with:
+          repository: tgundhus/better-auth
+          ref: 8f718a7478c1d49c7864685b0892684f535123dd
+          path: .enterprise-scim-source
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+          run_install: false
+      - run: pnpm install --frozen-lockfile --filter '@better-auth/scim...'
+        working-directory: .enterprise-scim-source
+      - run: pnpm --filter '@better-auth/scim^...' build
+        working-directory: .enterprise-scim-source
+      - run: pnpm --filter @better-auth/scim build
+        working-directory: .enterprise-scim-source
+      - run: pnpm exec vitest run packages/scim/src
+        working-directory: .enterprise-scim-source
+      - name: Install the pinned SCIM module for the contract
+        run: |
+          mkdir -p node_modules/.scim-enterprise-preview
+          cp .enterprise-scim-source/packages/scim/dist/index.mjs node_modules/.scim-enterprise-preview/index.mjs
+      - run: docker pull amazon/dynamodb-local:2.6.1
+      - name: Exercise Bulk and large-group lifecycle on DynamoDB Local
+        env:
+          SCIM_PREVIEW_MODULE: node_modules/.scim-enterprise-preview/index.mjs
+          SCIM_PREVIEW_DYNAMODB: '1'
+        run: node node_modules/vitest/vitest.mjs run --config vitest.preview.config.ts
