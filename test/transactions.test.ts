@@ -210,3 +210,15 @@ it("journals binary, sets, large numbers and large payloads without JSON type lo
   expect(codec.decode(parts)).toEqual(input);
   expect(codec.decode(codec.encode(null))).toBeNull();
 });
+
+it("keeps the durable journal format stable when DocumentClient mutates its translation options", () => {
+  const marshal = { convertTopLevelContainer: false, removeUndefinedValues: true };
+  const unmarshal = { convertWithoutMapWrapper: false };
+  const codec = new JournalCodec(marshal, unmarshal);
+  const item = { pk: "MODEL#test", sk: "a", nested: { value: "ok", absent: undefined } };
+  const before = codec.encode(item);
+  marshal.convertTopLevelContainer = true;
+  unmarshal.convertWithoutMapWrapper = true;
+  expect(codec.decode(before)).toEqual({ pk: item.pk, sk: item.sk, nested: { value: "ok" } });
+  expect(codec.decode(codec.encode(item))).toEqual(codec.decode(before));
+});

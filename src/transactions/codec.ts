@@ -8,14 +8,16 @@ export class JournalCodec {
 
   encode(item: Item | null): Uint8Array[] {
     if (item === null) return [];
-    const bytes = Buffer.from(JSON.stringify(marshall(item, this.marshal), binaryReplacer));
+    // DocumentClient mutates these options after its first request. The journal
+    // always stores an unwrapped attribute map, independent of SDK middleware.
+    const bytes = Buffer.from(JSON.stringify(marshall(item, { ...this.marshal, convertTopLevelContainer: false }), binaryReplacer));
     const size = 128 * 1024;
     return Array.from({ length: Math.ceil(bytes.length / size) }, (_, part) => bytes.subarray(part * size, (part + 1) * size));
   }
 
   decode(parts: Uint8Array[]): Item | null {
     if (parts.length === 0) return null;
-    return unmarshall(JSON.parse(Buffer.concat(parts).toString("utf8"), binaryReviver), this.unmarshal);
+    return unmarshall(JSON.parse(Buffer.concat(parts).toString("utf8"), binaryReviver), { ...this.unmarshal, convertWithoutMapWrapper: false });
   }
 }
 
