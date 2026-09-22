@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - The preview requires Better Auth `^1.7.5`. Transaction mode forces strongly consistent reads and removes the default page and IN-cardinality limits while retaining bounded native requests.
 - Transaction-mode storage requires all readers and writers to participate in the new protocol. Existing keys are preserved, but mixed versions and raw table consumers require a migration plan.
+- Transaction reads filter staged replacements before cloning them, avoiding copies of unrelated staged records during point lookups in large callbacks.
 
 This is an unpublished preview. Real AWS load, conflict/recovery testing, and migration rehearsals remain required before production release. Stable 1.2 behavior remains available on `main`.
 

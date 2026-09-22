@@ -27,6 +27,19 @@ function changes(count: number): Change[] {
 function updates(command: any): Record<string, any>[] { return command instanceof TransactWriteCommand ? (command.input.TransactItems ?? []).flatMap((action) => action.Update ?? []) : []; }
 
 describe("DynamoDB callback transactions", () => {
+  it("filters staged replacements without resurrecting old indexed values or exposing mutable staged records", async () => {
+    const { store } = await fixture();
+    await store.create("user", { id: "existing", email: "old@example.test", profile: { label: "original" } });
+    await store.transaction(async (trx) => {
+      await trx.update("user", id("existing"), { email: "new@example.test" });
+      expect(await trx.findOne("user", eq("email", "old@example.test"))).toBeNull();
+      expect(await trx.count("user", eq("email", "old@example.test"))).toBe(0);
+      const row = await trx.findOne<{ profile: { label: string } }>("user", eq("email", "new@example.test"));
+      row!.profile.label = "outside mutation";
+      expect(await trx.findOne("user", id("existing"))).toMatchObject({ profile: { label: "original" } });
+    });
+    expect(await store.findOne("user", id("existing"))).toMatchObject({ email: "new@example.test", profile: { label: "original" } });
+  });
   it("rejects TTL configuration that would overwrite the durable decision", async () => {
     const db = new MemoryDynamoDB();
     await expect(initializeDynamoDBTransactions({ tableName: "auth", client: db.asClient(), transactions: true, ttl: { attributeName: "state", fields: {} } })).rejects.toThrow("reserved journal metadata");

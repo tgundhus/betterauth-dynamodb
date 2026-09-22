@@ -56,11 +56,11 @@ export class CallbackContext {
     this.observations.set(id, { key, item: structuredClone(item) });
   }
 
-  overlay(model: string, rows: StoredItem[]): StoredItem[] {
+  overlay(model: string, rows: StoredItem[], matches: (item: StoredItem) => boolean): StoredItem[] {
     this.assertOpen();
     const merged = new Map(rows.map((row) => [keyId(row), row]));
     for (const [id, item] of this.writes) {
-      if (item?.model === model) merged.set(id, structuredClone(item));
+      if (item?.model === model && matches(item)) merged.set(id, structuredClone(item));
       else merged.delete(id);
     }
     return [...merged.values()];

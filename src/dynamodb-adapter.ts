@@ -155,7 +155,7 @@ export class DynamoDBStore {
   private async loadRows(model: string, plan: QueryPlan, take?: number): Promise<StoredItem[]> {
     if (!this.context) return this.loadRawRows(model, plan, take);
     const rows = await this.loadRawRows(model, plan);
-    const matches = visibleRows(this.context.overlay(model, rows), this.options.ttl).filter((row) => matchesWhere(row, plan.where));
+    const matches = visibleRows(this.context.overlay(model, rows, (row) => matchesWhere(row, plan.where)), this.options.ttl).filter((row) => matchesWhere(row, plan.where));
     return transactionReadOrder(matches, plan);
   }
 
