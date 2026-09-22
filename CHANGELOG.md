@@ -19,6 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Transaction-mode storage requires all readers and writers to participate in the new protocol. Existing keys are preserved, but mixed versions and raw table consumers require a migration plan.
 - Transaction reads filter staged replacements before cloning them, avoiding copies of unrelated staged records during point lookups in large callbacks.
 
+### Fixed
+
+- A transient storage-format read failure no longer leaves the adapter permanently unavailable. A later request retries initialization on the same adapter instance.
+
 This is an unpublished preview. Real AWS load, conflict/recovery testing, and migration rehearsals remain required before production release. Stable 1.2 behavior remains available on `main`.
 
 ## [1.2.0] - 2026-09-21

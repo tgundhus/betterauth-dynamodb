@@ -2,7 +2,7 @@ import { GetCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { describe, expect, it } from "vitest";
 import { DynamoDBStore } from "../src/dynamodb-adapter.js";
 import { initializeDynamoDBTransactions, recoverDynamoDBTransactions } from "../src/transactions/maintenance.js";
-import { INTENT, keyId, PHYSICAL_VERSION, rootKey, versioned } from "../src/transactions/format.js";
+import { FORMAT_KEY, INTENT, keyId, PHYSICAL_VERSION, rootKey, versioned } from "../src/transactions/format.js";
 import { JournalCodec } from "../src/transactions/codec.js";
 import { TransactionEngine, DynamoDBTransactionOutcomeUnknownError } from "../src/transactions/engine.js";
 import { Journal } from "../src/transactions/journal.js";
@@ -27,6 +27,17 @@ function changes(count: number): Change[] {
 function updates(command: any): Record<string, any>[] { return command instanceof TransactWriteCommand ? (command.input.TransactItems ?? []).flatMap((action) => action.Update ?? []) : []; }
 
 describe("DynamoDB callback transactions", () => {
+  it("recovers the same adapter instance after a transient format-marker read failure", async () => {
+    const { store, db } = await fixture();
+    let failures = 1;
+    db.before = (command) => {
+      if (command instanceof GetCommand && command.input.Key?.pk === FORMAT_KEY.pk && failures-- > 0) throw new Error("temporary marker read outage");
+    };
+    await expect(store.findOne("user", id("missing"))).rejects.toThrow("temporary marker read outage");
+    expect(await store.findOne("user", id("missing"))).toBeNull();
+    await store.create("user", { id: "available", email: "available@example.test" });
+    expect(await store.findOne("user", id("available"))).toMatchObject({ id: "available" });
+  });
   it("filters staged replacements without resurrecting old indexed values or exposing mutable staged records", async () => {
     const { store } = await fixture();
     await store.create("user", { id: "existing", email: "old@example.test", profile: { label: "original" } });

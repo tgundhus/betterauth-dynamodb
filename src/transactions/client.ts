@@ -10,7 +10,7 @@ import type { Item, Key } from "./types.js";
 export function participatingClient(base: DynamoDBDocumentClient, engine: TransactionEngine): DynamoDBDocumentClient {
   let ready: Promise<void> | undefined;
   const send = async (command: any) => {
-    ready ??= checkFormat(engine);
+    ready ??= checkFormat(engine).catch((error: unknown) => { ready = undefined; throw error; });
     await ready;
     if (command instanceof TransactWriteCommand) return guardedWrite(base, engine, command);
     return resolveResponse(engine, command, await base.send(command));
