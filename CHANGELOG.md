@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The preview requires Better Auth `^1.7.5`. Transaction mode forces strongly consistent reads and removes the default page and IN-cardinality limits while retaining bounded native requests.
 - Transaction-mode storage requires all readers and writers to participate in the new protocol. Existing keys are preserved, but mixed versions and raw table consumers require a migration plan.
 - Transaction reads filter staged replacements before cloning them, avoiding copies of unrelated staged records during point lookups in large callbacks.
+- Transaction-scoped multi-row creates batch strongly consistent absence checks, and the companion SCIM fork can use `maxBulkConcurrency` for independent projection work on distinct users while retaining one atomic Group commit.
 
 ### Fixed
 

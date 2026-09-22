@@ -214,8 +214,9 @@ export class DynamoDBStore {
   }
 
   async transactCreate(items: { model: string; data: Record<string, unknown> }[]): Promise<void> {
-    if (this.context) { for (const item of items) await this.create(item.model, item.data); return; }
-    await this.transactPutNew(items.flatMap((item) => [toStoredItem(item.model, item.data, this.options.ttl), ...this.allSidecars(item.model, item.data)]), "transactCreate");
+    const stored = items.map((item) => toStoredItem(item.model, item.data, this.options.ttl));
+    if (this.context) { await this.context.createMany(stored, this.client); return; }
+    await this.transactPutNew(stored.flatMap((item) => [item, ...this.allSidecars(item.model, item.entity)]), "transactCreate");
   }
 
   private async transactPutNew(items: (StoredItem | SidecarItem)[], operation: string): Promise<void> {

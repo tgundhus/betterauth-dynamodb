@@ -9,7 +9,7 @@ Adapter CI builds the immutable companion revision in [ci.yml](../.github/workfl
 ```sh
 git clone https://github.com/tgundhus/better-auth.git scim-contract-source
 cd scim-contract-source
-git checkout f623e43ae60f66349109e1eb28fc242162178f0f
+git checkout 5f33f4cb1b08040bd90758b5bb0de9cc57e896f0
 pnpm install --frozen-lockfile --filter '@better-auth/scim...'
 pnpm --filter '@better-auth/scim^...' build
 pnpm --filter @better-auth/scim build

@@ -31,7 +31,7 @@ function adapterFactory(adapterOptions: BetterAuthDynamoDBOptions, scopedStore?:
       supportsNumericIds: false,
       transaction: adapterOptions.transactions ? (callback) => store.transaction((scoped) => callback(adapterFactory(adapterOptions, scoped)(options))) : false
     },
-    adapter: ({ schema, getModelName, getFieldName }) => {
+    adapter: ({ schema, getModelName, getFieldName, getDefaultModelName, transformInput, transformOutput }) => {
       const schemaUniqueFields = collectUniqueFields(schema, getModelName, getFieldName);
       const schemaUniqueIndexes = adapterOptions.enforceSchemaUniqueIndexes ? collectSchemaUniqueIndexes(schema, getModelName, getFieldName) : [];
       store = scopedStore ?? new DynamoDBStore({ ...adapterOptions, uniqueFields: mergeUniqueFields(schemaUniqueFields, adapterOptions.uniqueFields), schemaUniqueIndexes });
@@ -53,7 +53,19 @@ function adapterFactory(adapterOptions: BetterAuthDynamoDBOptions, scopedStore?:
         consumeOne: <T>(data: { model: string; where: any[] }) => store.consumeOne<T>(data.model, data.where),
         incrementOne: <T>(data: { model: string; where: any[]; increment: Record<string, number>; set?: Record<string, unknown> }) =>
           store.incrementOne<T>(data.model, data.where, data.increment, data.set),
-        options: { tableName: adapterOptions.tableName }
+        options: {
+          tableName: adapterOptions.tableName,
+          ...(scopedStore ? { transactionBatch: {
+            maxConcurrency: adapterOptions.maxBulkConcurrency ?? 8,
+            createMany: async (input: { model: string; data: Record<string, unknown>[] }) => {
+              const defaultModel = getDefaultModelName(input.model);
+              const model = getModelName(input.model);
+              const data = await Promise.all(input.data.map((row) => transformInput(row, defaultModel, "create")));
+              await store.transactCreate(data.map((row) => ({ model, data: row })));
+              return Promise.all(data.map((row) => transformOutput(row, defaultModel)));
+            }
+          } } : {})
+        }
       };
       return adapter;
     }

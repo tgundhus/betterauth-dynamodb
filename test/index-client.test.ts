@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import type { TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { BatchGetCommand, type TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { createDocumentClient, normalizeOptions } from "../src/client.js";
 import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../src/index.js";
 import { uniquePk, valueSk } from "../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../src/serialize.js";
+import { initializeDynamoDBTransactions } from "../src/transactions/maintenance.js";
+import { MemoryDynamoDB } from "./helpers/memory-dynamodb.js";
 
 describe("public adapter and client helpers", () => {
   it("normalizes option defaults and builds a document client", () => {
@@ -37,6 +39,37 @@ describe("public adapter and client helpers", () => {
     await adapter.delete({ model: "user", where: [{ field: "id", value: "u" }] });
     await adapter.deleteMany({ model: "user", where: [{ field: "email", value: "a@example.com" }] });
     await adapter.consumeOne({ model: "user", where: [{ field: "id", value: "u" }] });
+  });
+
+  it("exposes mapped transaction batch creates with generated ids", async () => {
+    const db = new MemoryDynamoDB();
+    const options = { tableName: "auth", client: db.asClient(), transactions: true };
+    await initializeDynamoDBTransactions(options);
+    const adapter = dynamoDBAdapter(options)({ secret: "x", user: { modelName: "app_user", fields: { email: "email_address" } } } as never);
+    type BatchCapability = { createMany(input: { model: string; data: Record<string, unknown>[] }): Promise<Record<string, unknown>[]>; maxConcurrency: number };
+    expect(adapter.options).not.toHaveProperty("transactionBatch");
+
+    db.commands.length = 0;
+    const result = await adapter.transaction!(async (transaction) => {
+      const capability = (transaction.options as unknown as { transactionBatch: BatchCapability }).transactionBatch;
+      const created = await capability.createMany({
+        model: "user",
+        data: [
+          { email: "ada@example.com", name: "Ada", emailVerified: true, createdAt: new Date(), updatedAt: new Date() },
+          { email: "grace@example.com", name: "Grace", emailVerified: true, createdAt: new Date(), updatedAt: new Date() }
+        ]
+      });
+      return { created, batchGets: db.commands.filter((command) => command instanceof BatchGetCommand).length };
+    });
+    const { created } = result;
+
+    expect(created).toEqual([
+      expect.objectContaining({ id: expect.any(String), email: "ada@example.com", name: "Ada" }),
+      expect.objectContaining({ id: expect.any(String), email: "grace@example.com", name: "Grace" })
+    ]);
+    expect(new Set(created.map((row) => row.id)).size).toBe(2);
+    expect(result.batchGets).toBe(1);
+    expect(await adapter.findOne({ model: "user", where: [{ field: "email", value: "ada@example.com" }] })).toMatchObject({ email: "ada@example.com", name: "Ada" });
   });
 
   it.each([

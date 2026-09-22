@@ -1,5 +1,6 @@
 import { BatchGetCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import { batchGetAttempts } from "../batch-get.js";
 import { DynamoDBConflictError } from "../errors.js";
 import { REVISION_ATTRIBUTE } from "../serialize.js";
 import type { SidecarItem, StoredItem } from "../types.js";
@@ -78,6 +79,18 @@ export class CallbackContext {
       const result = await client.send(new GetCommand({ TableName: this.engine.journal.tableName, Key: key, ConsistentRead: true }));
       this.observe(key, (result.Item ?? null) as StoredItem | null);
     }
+    this.stageCreate(item);
+  }
+
+  async createMany(items: StoredItem[], client: DynamoDBDocumentClient): Promise<void> {
+    this.assertOpen();
+    const unread = [...new Map(items.map((item) => [keyId(item), keyOf(item)])).values()].filter((key) => !this.observations.has(keyId(key)));
+    for (const batch of chunks(unread, 100)) await batchGetAttempts(client, this.engine.journal.tableName, batch, true);
+    for (const item of items) this.stageCreate(item);
+  }
+
+  private stageCreate(item: StoredItem): void {
+    const id = keyId(item);
     if (this.current(id)) this.fail("A transaction cannot create a record whose id already exists.");
     this.writes.set(id, structuredClone(item));
   }

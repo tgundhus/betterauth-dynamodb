@@ -1,4 +1,4 @@
-import { GetCommand, NumberValue, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { BatchGetCommand, GetCommand, NumberValue, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { describe, expect, it } from "vitest";
 import { DynamoDBStore } from "../src/dynamodb-adapter.js";
 import { initializeDynamoDBTransactions, recoverDynamoDBTransactions } from "../src/transactions/maintenance.js";
@@ -81,6 +81,19 @@ describe("DynamoDB callback transactions", () => {
     expect(await store.count("user")).toBe(44);
     expect(await store.findOne("user", id("0"))).toMatchObject({ count: 2, email: "changed@example.test" });
     expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
+  });
+
+  it("batch-checks transactional create absence without changing atomic visibility", async () => {
+    const { store, db } = await fixture();
+    db.commands.length = 0;
+    await store.transaction(async (trx) => {
+      await trx.transactCreate(Array.from({ length: 205 }, (_, index) => ({ model: "member", data: { id: `m-${index}`, groupId: "g" } })));
+      expect(db.commands.filter((command) => command instanceof BatchGetCommand)).toHaveLength(3);
+      expect(db.commands.filter((command) => command instanceof GetCommand && String(command.input.Key?.pk).startsWith("MODEL#"))).toHaveLength(0);
+      expect(await trx.count("member", eq("groupId", "g"))).toBe(205);
+      expect(await store.count("member", eq("groupId", "g"))).toBe(0);
+    });
+    expect(await store.count("member", eq("groupId", "g"))).toBe(205);
   });
 
   it("discards callback failures, including a saved transaction adapter used after its lifetime", async () => {
