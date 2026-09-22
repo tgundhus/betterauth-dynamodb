@@ -98,13 +98,12 @@ export class TransactionEngine {
     catch (error) { if (error instanceof DynamoDBAdapterError) return undefined; throw error; }
   }
 
-  async recover(id: string): Promise<boolean> {
+  async recover(id: string, batches = Infinity): Promise<boolean> {
     const decision = await this.recoveryDecision(id);
-    if (!decision) return true;
+    if (!decision) throw new DynamoDBAdapterError("The recovery registry references a missing transaction decision; restore or repair the journal.");
     if (decision.state === "PREPARING") return false;
-    await this.restoreEntries(decision);
-    await this.journal.purge(id);
-    return true;
+    const remaining = await this.restoreEntries(decision, batches);
+    return remaining > 0 && await this.journal.purge(id, remaining);
   }
 
   /** Ordinary writes help release terminal intents and wait for live owners without stealing their locks. */
@@ -133,18 +132,29 @@ export class TransactionEngine {
     return this.journal.decision(id);
   }
 
-  private async restoreEntries(decision: Decision): Promise<void> {
+  private async restoreEntries(decision: Decision, batches: number): Promise<number> {
     let entries: { entry: Entry; index: number }[] = [];
     let bytes = 0;
     for await (const row of this.journal.rows(dataPk(decision.id), "E#")) {
       const entry = row as Entry;
       // Encoded payload bytes conservatively bound native item bytes.
       const size = (entry.before + entry.after) * 128 * 1024 + 1024;
-      if (entries.length === 99 || bytes + size > 3_000_000) { await this.restoreBatch(decision, entries); entries = []; bytes = 0; }
+      if (restoreBatchFull(entries.length, bytes + size)) {
+        await this.restoreAndCheckpoint(decision, entries); entries = []; bytes = 0;
+        if (--batches === 0) return 0;
+      }
       entries.push({ entry, index: Number(String(row.sk).slice(2)) });
       bytes += size;
     }
-    if (entries.length) await this.restoreBatch(decision, entries);
+    if (entries.length) { await this.restoreAndCheckpoint(decision, entries); batches--; }
+    return batches;
+  }
+
+  private async restoreAndCheckpoint(decision: Decision, entries: { entry: Entry; index: number }[]): Promise<void> {
+    await this.restoreBatch(decision, entries);
+    // A missing manifest is safe only after its target no longer carries this
+    // transaction's intent. Deletion checkpoints progress without a size cap.
+    await this.journal.removeEntries(decision.id, entries.map(({ index }) => index));
   }
 
   private async restoreBatch(decision: Decision, entries: { entry: Entry; index: number }[]): Promise<void> {
@@ -186,6 +196,8 @@ function ownedBy(item: Item | null, id: string, entry: number): boolean {
   const intent = intentOf(item);
   return intent?.id === id && intent.entry === entry;
 }
+
+function restoreBatchFull(count: number, bytes: number): boolean { return count > 0 && (count === 99 || bytes > 3_000_000); }
 
 function validateChanges(input: Change[]): Change[] {
   const keys = input.map((change) => keyId(change.key));

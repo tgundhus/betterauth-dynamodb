@@ -19,7 +19,7 @@ Version `1.2.0` focuses on reducing unnecessary DynamoDB requests and handling r
 - Strongly consistent reads remain the default, with an explicit option for eventual consistency.
 - Query planning and TTL fixes cover case-insensitive ID filters, ordinary fields named `ttl`, and records that expire during pagination.
 
-The 2.0 preview adds `transactions: true`, storage initialization, and a recovery API. It uses Better Auth's official `createAdapterFactory` API and requires Better Auth `^1.7.5`. Unit tests, DynamoDB Local integration tests, and Better Auth's adapter conformance suites cover the implementation. See the [changelog](./CHANGELOG.md) for release details.
+The 2.0 preview adds `transactions: true`, storage initialization, and a recovery API. A [scheduled Lambda worker](./examples/aws-lambda/README.md) checkpoints bounded recovery across invocations. It uses Better Auth's official `createAdapterFactory` API and requires Better Auth `^1.7.5`. Unit tests, DynamoDB Local integration tests, and Better Auth's adapter conformance suites cover the implementation. See the [changelog](./CHANGELOG.md) for release details.
 
 ## Installation
 

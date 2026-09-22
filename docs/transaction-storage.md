@@ -40,6 +40,12 @@ An acknowledgement failure with an unresolved outcome throws `DynamoDBTransactio
 
 ## Run a recovery worker
 
+`runDynamoDBRecoveryWorker(options, workerOptions)` supplies a bounded worker with a durable checkpoint in the authentication table. Each invocation resumes the checkpoint; completing a registry pass resets it for the next pass. It reports per-transaction failures and continues unrelated recovery. Conditional checkpoint writes prevent overlapping workers from overwriting each other's progress. Monitor reported failures and repeat passes, including after an empty pass.
+
+The [Lambda example](../examples/aws-lambda/README.md) includes a scheduled handler, request deadlines, restricted table permissions, alarms, and a dead-letter queue. No bearer credentials or HTTP endpoint are needed for transaction recovery.
+
+For custom workers, the fourth argument to `recoverDynamoDBTransactions` accepts `{ maxBatchesPerTransaction: 1, continueOnError: true }`. Cleanup deletes each manifest entry only after releasing its intent. That provides durable progress between invocations without imposing a transaction size limit. A cleanup batch processes at most 99 manifest entries, further bounded by its byte budget, or 99 payload rows; it can require multiple native reads/writes. `failures` identifies entries requiring attention. A partial cleanup is not counted as recovered and retains its registry entry. No decision or live payload expires while recovery remains incomplete.
+
 Schedule an application-owned worker with the same table and injected client. It walks only the dedicated transaction registry. Each returned cursor can be persisted between worker invocations. Finish a pass, then start a new pass periodically so live transactions skipped in an earlier pass are revisited.
 
 ```ts

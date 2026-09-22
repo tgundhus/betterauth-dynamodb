@@ -12,7 +12,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
 import { betterAuth } from "better-auth";
 import { oauthProvider } from "@better-auth/oauth-provider";
-import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter, initializeDynamoDBTransactions, recoverDynamoDBTransactions } from "../../src/index.js";
+import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter, initializeDynamoDBTransactions, recoverDynamoDBTransactions, runDynamoDBRecoveryWorker } from "../../src/index.js";
 import { DynamoDBStore } from "../../src/dynamodb-adapter.js";
 import { INTENT } from "../../src/transactions/format.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
@@ -64,6 +64,32 @@ describe("DynamoDB Local adapter integration", () => {
 
   afterEach(async () => {
     await deleteTable(nativeClient, tableName);
+  });
+
+  it("resumes bounded recovery through durable Lambda checkpoints on native DynamoDB", async () => {
+    let interrupt = true;
+    const broken = { config: docClient.config, send: async (command: any) => {
+      if (interrupt && command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("cleanup interrupted");
+      return docClient.send(command);
+    } } as unknown as DynamoDBDocumentClient;
+    const options = { tableName, client: broken, transactions: true };
+    await initializeDynamoDBTransactions(options);
+    const store = new DynamoDBStore(options);
+    await store.transaction(async (trx) => {
+      for (let index = 0; index < 55; index++) await trx.create("member", { id: `bounded-${index}`, groupId: "g" });
+    });
+    expect((await rawRow(modelPk("member"), entitySk("bounded-0")))?.[INTENT]).toBeDefined();
+    interrupt = false;
+    let recovered = 0;
+    for (let invocation = 0; invocation < 100 && recovered === 0; invocation++) {
+      const result = await runDynamoDBRecoveryWorker(options, { maxCalls: 2, maxBatchesPerTransaction: 1 });
+      recovered += result.recovered;
+      expect(result.failures).toEqual([]);
+    }
+    expect(recovered).toBe(1);
+    expect(await store.count("member", [eq("groupId", "g")])).toBe(55);
+    expect((await rawRow(modelPk("member"), entitySk("bounded-0")))?.[INTENT]).toBeUndefined();
+    expect(await rawRow("BETTERAUTH#MAINTENANCE", "transactions")).toHaveProperty("revision");
   });
 
   it("atomically commits a callback spanning more than 1,000 physical items", async () => {

@@ -13,5 +13,5 @@
     "skipLibCheck": true,
     "types": ["node", "vitest/globals"]
   },
-  "include": ["src", "test", "scripts", "eslint.config.js", "vitest.config.ts"]
+  "include": ["src", "test", "scripts", "examples/aws-lambda", "eslint.config.js", "vitest.config.ts"]
 }

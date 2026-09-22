@@ -9,7 +9,9 @@ export type { BetterAuthDynamoDBOptions, TtlOptions } from "./types.js";
 export { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError } from "./errors.js";
 export { initializeDynamoDBTransactions, recoverDynamoDBTransactions } from "./transactions/maintenance.js";
 export { DynamoDBTransactionOutcomeUnknownError } from "./transactions/engine.js";
-export type { TransactionRecoveryCursor, TransactionRecoveryResult } from "./transactions/maintenance.js";
+export { runDynamoDBRecoveryWorker } from "./transactions/worker.js";
+export type { DynamoDBRecoveryWorkerOptions, DynamoDBRecoveryWorkerResult } from "./transactions/worker.js";
+export type { TransactionRecoveryCursor, TransactionRecoveryResult, TransactionRecoveryOptions, TransactionRecoveryFailure } from "./transactions/maintenance.js";
 
 export function dynamoDBAdapter(adapterOptions: BetterAuthDynamoDBOptions) {
   return adapterFactory(adapterOptions);

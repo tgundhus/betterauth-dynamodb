@@ -89,19 +89,34 @@ export class Journal {
     } while (cursor);
   }
 
-  async purge(id: string): Promise<void> {
+  async removeEntries(id: string, entries: number[]): Promise<void> {
+    await this.send([this.terminalGuard(id), ...entries.map((index) => ({ Delete: { TableName: this.tableName, Key: entryKey(id, index) } }))]);
+  }
+
+  async purge(id: string, batches = Infinity): Promise<boolean> {
     let actions: Action[] = [];
     for await (const item of this.rows(dataPk(id))) {
       if (item.sk === "ROOT") continue;
       actions.push({ Delete: { TableName: this.tableName, Key: keyOf(item) } });
-      if (actions.length === 99) { await this.send([this.terminalGuard(id), ...actions]); actions = []; }
+      if (actions.length === 99) {
+        await this.send([this.terminalGuard(id), ...actions]); actions = [];
+        if (--batches === 0) return false;
+      }
     }
-    if (actions.length) await this.send([this.terminalGuard(id), ...actions]);
+    return this.finishPurge(id, actions, batches);
+  }
+
+  private async finishPurge(id: string, actions: Action[], batches: number): Promise<boolean> {
+    if (actions.length) {
+      await this.send([this.terminalGuard(id), ...actions]);
+      if (--batches === 0) return false;
+    }
     const guard = this.terminalGuard(id).ConditionCheck!;
     await this.send([
       { Update: { ...guard, UpdateExpression: "SET cleaned = :cleaned, #ttl = :ttl", ExpressionAttributeNames: { ...guard.ExpressionAttributeNames, "#ttl": this.ttlAttribute }, ExpressionAttributeValues: { ...guard.ExpressionAttributeValues, ":cleaned": true, ":ttl": Math.floor(Date.now() / 1000) + 7 * 86400 } } },
       { Delete: { TableName: this.tableName, Key: registryKey(id) } }
     ]);
+    return true;
   }
 
   terminalGuard(id: string): Action {

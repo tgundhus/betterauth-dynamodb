@@ -8,7 +8,14 @@ import { FORMAT, FORMAT_KEY } from "./format.js";
 import { Journal } from "./journal.js";
 
 export interface TransactionRecoveryCursor { shard: number; key?: Record<string, unknown> }
-export interface TransactionRecoveryResult { examined: number; recovered: number; cursor?: TransactionRecoveryCursor }
+export interface TransactionRecoveryFailure { transactionId: string; error: unknown }
+export interface TransactionRecoveryOptions {
+  /** Bound cleanup work for each registry entry. Omission completes each transaction. */
+  maxBatchesPerTransaction?: number;
+  /** Retain failed transactions in the registry and report them while advancing to other entries. */
+  continueOnError?: boolean;
+}
+export interface TransactionRecoveryResult { examined: number; recovered: number; cursor?: TransactionRecoveryCursor; failures: TransactionRecoveryFailure[] }
 
 /** Run only after stopping incompatible writers and readers; see the storage migration instructions. */
 export async function initializeDynamoDBTransactions(options: BetterAuthDynamoDBOptions): Promise<void> {
@@ -17,30 +24,45 @@ export async function initializeDynamoDBTransactions(options: BetterAuthDynamoDB
 }
 
 /** Explicit maintenance over the transaction registry, never an authentication model scan. */
-export async function recoverDynamoDBTransactions(options: BetterAuthDynamoDBOptions, cursor: TransactionRecoveryCursor = { shard: 0 }, limit = 25): Promise<TransactionRecoveryResult> {
+export async function recoverDynamoDBTransactions(options: BetterAuthDynamoDBOptions, cursor: TransactionRecoveryCursor = { shard: 0 }, limit = 25, recovery: TransactionRecoveryOptions = {}): Promise<TransactionRecoveryResult> {
   validateCursor(cursor, limit);
+  validateRecoveryOptions(recovery);
   const journal = journalFor(options);
   const engine = new TransactionEngine(journal);
   let examined = 0;
   let recovered = 0;
+  const failures: TransactionRecoveryFailure[] = [];
   let position: TransactionRecoveryCursor | undefined = cursor;
   while (position && examined < limit) {
     const page = await registryPage(journal, position, limit - examined);
-    const result = await recoverPage(engine, page.Items ?? []);
+    const result = await recoverPage(engine, page.Items ?? [], recovery);
     examined += result.examined;
     recovered += result.recovered;
+    failures.push(...result.failures);
     position = nextCursor(position, page.LastEvaluatedKey);
   }
-  return { examined, recovered, ...(position ? { cursor: position } : {}) };
+  return { examined, recovered, failures, ...(position ? { cursor: position } : {}) };
 }
 
-async function recoverPage(engine: TransactionEngine, items: Record<string, any>[]) {
+async function recoverPage(engine: TransactionEngine, items: Record<string, any>[], options: TransactionRecoveryOptions) {
   let recovered = 0;
-  for (const item of items) if (await engine.recover(item.id)) recovered++;
-  return { examined: items.length, recovered };
+  const failures: TransactionRecoveryFailure[] = [];
+  for (const item of items) {
+    try { if (await engine.recover(item.id, options.maxBatchesPerTransaction)) recovered++; }
+    catch (error) {
+      if (!options.continueOnError) throw error;
+      failures.push({ transactionId: item.id, error });
+    }
+  }
+  return { examined: items.length, recovered, failures };
 }
 
 function journalFor(options: BetterAuthDynamoDBOptions): Journal { return new Journal(createDocumentClient(options), options.tableName, ttlAttribute(options.ttl)); }
+
+function validateRecoveryOptions(options: TransactionRecoveryOptions): void {
+  const limit = options.maxBatchesPerTransaction;
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) throw new DynamoDBAdapterError("Recovery batch limit must be a positive safe integer.");
+}
 
 function validateCursor(cursor: TransactionRecoveryCursor, limit: number): void {
   if (!Number.isSafeInteger(limit) || limit < 1) throw new DynamoDBAdapterError("Recovery limit must be a positive safe integer.");

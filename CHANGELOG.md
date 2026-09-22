@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Recovery can be bounded across Lambda invocations, retains durable cleanup progress, and reports damaged transactions without blocking unrelated maintenance. A scheduled worker and AWS SAM deployment example are included.
 - A transient storage-format read failure no longer leaves the adapter permanently unavailable. A later request retries initialization on the same adapter instance.
 
 This is an unpublished preview. Real AWS load, conflict/recovery testing, and migration rehearsals remain required before production release. Stable 1.2 behavior remains available on `main`.

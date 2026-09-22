@@ -171,6 +171,68 @@ describe("DynamoDB callback transactions", () => {
 
 describe("durable commit and recovery", () => {
 
+  it("reports a damaged transaction while recovering unrelated work and validates work limits", async () => {
+    const db = new MemoryDynamoDB();
+    const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+    db.before = (command) => { if (command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("cleanup unavailable"); };
+    await engine.commit(changes(2));
+    const broken = [...db.rows.values()].find((row) => row.state === "COMMITTED")!;
+    const other = changes(2).map((change) => ({ ...change, key: { ...change.key, pk: "MODEL#other" }, after: { ...change.after, pk: "MODEL#other" } }));
+    await engine.commit(other);
+    db.before = (command) => { if (command instanceof GetCommand && command.input.Key?.pk === broken.pk && command.input.Key?.sk === "ROOT") throw new Error("unreadable decision"); };
+    const options = { tableName: "auth", client: db.asClient() };
+    const result = await recoverDynamoDBTransactions(options, undefined, 25, { continueOnError: true });
+    expect(result).toMatchObject({ examined: 2, recovered: 1, failures: [{ transactionId: broken.id, error: expect.any(Error) }] });
+    expect(db.get(other[0]!.key)?.[INTENT]).toBeUndefined();
+    expect(db.get(changes(1)[0]!.key)?.[INTENT]).toBeDefined();
+    await expect(recoverDynamoDBTransactions(options)).rejects.toThrow("unreadable decision");
+    for (const maxBatchesPerTransaction of [0, Infinity, 1.5]) {
+      await expect(recoverDynamoDBTransactions(options, undefined, 25, { maxBatchesPerTransaction })).rejects.toThrow("positive safe integer");
+    }
+    db.before = () => {};
+    await expect(engine.recover("missing")).rejects.toThrow("missing transaction decision");
+    expect((await recoverDynamoDBTransactions(options)).recovered).toBe(1);
+  });
+
+  it("resumes after losing acknowledgement of a cleanup checkpoint", async () => {
+    const db = new MemoryDynamoDB();
+    const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+    let failed = false;
+    db.after = (command) => {
+      if (!failed && command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => String(action.Delete?.Key?.sk).startsWith("E#"))) {
+        failed = true;
+        throw new Error("checkpoint acknowledgement lost");
+      }
+    };
+    await engine.commit(changes(45));
+    expect(failed).toBe(true);
+    expect((await recoverDynamoDBTransactions({ tableName: "auth", client: db.asClient() })).recovered).toBe(1);
+    expect([...db.rows.values()].filter((row) => row.pk === "MODEL#test")).toHaveLength(45);
+    expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
+  });
+
+  it("resumes bounded cleanup across fresh recovery invocations without expiring live journal data", async () => {
+    const db = new MemoryDynamoDB();
+    const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+    db.before = (command) => { if (command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("cleanup unavailable"); };
+    await engine.commit(changes(1_005));
+    const root = [...db.rows.values()].find((row) => row.state === "COMMITTED")!;
+    db.before = () => {};
+    const options = { tableName: "auth", client: db.asClient() };
+    const first = await recoverDynamoDBTransactions(options, undefined, 25, { maxBatchesPerTransaction: 1 });
+    expect(first.recovered).toBe(0);
+    expect(db.get(root)?.ttl).toBeUndefined();
+    expect([...db.rows.values()].some((row) => row[INTENT])).toBe(true);
+    for (let attempt = 0; attempt < 150 && !db.get(root)?.cleaned; attempt++) {
+      await recoverDynamoDBTransactions(options, undefined, 25, { maxBatchesPerTransaction: 1 });
+    }
+    expect(db.get(root)).toMatchObject({ cleaned: true, state: "COMMITTED" });
+    expect(db.get(root)?.ttl).toBeGreaterThan(Date.now() / 1000);
+    expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
+    expect([...db.rows.values()].filter((row) => row.pk === "MODEL#test")).toHaveLength(1_005);
+    expect([...db.rows.values()].filter((row) => row.pk === root.pk)).toHaveLength(1);
+  });
+
   it("batches recovery reads and tolerates another writer releasing an item during cleanup", async () => {
     const db = new MemoryDynamoDB();
     const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
