@@ -7,13 +7,26 @@ type Hook = (command: any, database: MemoryDynamoDB) => Promise<void> | void;
 /** Independent command-level test double; integration tests verify these requests against DynamoDB Local. */
 export class MemoryDynamoDB {
   readonly rows = new Map<string, Row>();
+  private readonly partitions = new Map<string, Map<string, Row>>();
   readonly commands: any[] = [];
   readonly config = { translateConfig: { marshallOptions: { removeUndefinedValues: true } } };
   before: Hook = () => {};
   after: Hook = () => {};
   asClient(): DynamoDBDocumentClient { return this as unknown as DynamoDBDocumentClient; }
   get(key: Row): Row | undefined { return structuredClone(this.rows.get(keyId(key))); }
-  put(item: Row): void { this.rows.set(keyId(item), structuredClone(item)); }
+  put(item: Row): void {
+    const copy = structuredClone(item);
+    this.rows.set(keyId(item), copy);
+    let partition = this.partitions.get(item.pk);
+    if (!partition) { partition = new Map(); this.partitions.set(item.pk, partition); }
+    partition.set(item.sk, copy);
+  }
+  private delete(key: Row): void {
+    this.rows.delete(keyId(key));
+    const partition = this.partitions.get(key.pk);
+    partition?.delete(key.sk);
+    if (!partition?.size) this.partitions.delete(key.pk);
+  }
 
   async send(command: any): Promise<any> {
     this.commands.push(command);
@@ -32,7 +45,9 @@ export class MemoryDynamoDB {
   }
 
   private query(input: Row): Row {
-    let rows = [...this.rows.values()].filter((item) => condition(input.KeyConditionExpression, item, input)).sort((a, b) => String(a.sk).localeCompare(String(b.sk)));
+    const partitionKey = input.ExpressionAttributeValues?.[":pk"];
+    const candidates = partitionKey === undefined ? this.rows.values() : (this.partitions.get(partitionKey)?.values() ?? []);
+    let rows = [...candidates].filter((item) => condition(input.KeyConditionExpression, item, input)).sort((a, b) => String(a.sk).localeCompare(String(b.sk)));
     if (input.ExclusiveStartKey) rows = rows.filter((item) => String(item.sk).localeCompare(String(input.ExclusiveStartKey.sk)) > 0);
     const page = rows.slice(0, input.Limit ?? rows.length);
     const last = page.at(-1);
@@ -51,7 +66,7 @@ export class MemoryDynamoDB {
     if (failures.some((failure) => failure.Code !== "None")) throw Object.assign(new Error("ConditionalCheckFailed"), { name: "TransactionCanceledException", CancellationReasons: failures });
     for (const [kind, input] of operations) {
       if (kind === "Put") this.put(input.Item);
-      if (kind === "Delete") this.rows.delete(keyId(input.Key));
+      if (kind === "Delete") this.delete(input.Key);
       if (kind === "Update") this.put(update(this.get(input.Key) ?? input.Key, input));
     }
     return {};

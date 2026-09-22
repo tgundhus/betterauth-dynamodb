@@ -1,6 +1,6 @@
 # Callback transaction storage preview
 
-This is an opt-in 2.0 preview under active validation. It is not a completed SCIM or SSO compatibility release. Keep 1.2 production tables on their existing configuration until the transaction and plugin release gates in [the design](./enterprise-transactions.md) pass.
+This is an opt-in 2.0 preview under active validation. Published SCIM and SSO workflow tests pass against DynamoDB Local, but production compatibility still requires the [enterprise release gates](./enterprise-transactions.md). Keep 1.2 production tables on their existing configuration until those gates pass.
 
 ## Initialize in a maintenance window
 
@@ -32,6 +32,8 @@ This is an optimistic protocol. Concurrent changes or uniqueness conflicts can a
 
 No transaction-item-count cap is imposed on callbacks. Individual AWS calls stay within native limits. Ordinary operations outside a callback retain their existing single-mutation limits and are not aggregate-atomic when using bulk methods. AWS item size, throughput, and transport limits still apply.
 
+The journal batches payload reads and cleanup writes and stores large before/after payloads in 128 KiB parts. A conservative item-size check runs before preparation, including adapter metadata. It budgets numbers at DynamoDB's maximum numeric representation size, so a number-heavy item close to 400 KiB can be rejected before AWS would reject it. Keep individual authentication records comfortably below the item limit; group membership remains a relation of separate rows.
+
 Before commit, an interrupted transaction is aborted after its renewable preparation lease expires. After commit, cleanup failure leaves the committed decision and prepared versions readable. An ordinary writer can help release a conflicting terminal intent. Cleanup is idempotent and checks ownership before changing a row.
 
 An acknowledgement failure with an unresolved outcome throws `DynamoDBTransactionOutcomeUnknownError`, including `transactionId`. Do not blindly replay the mutation. Its durable root is `pk = BETTERAUTH#TXDATA#<transactionId>`, `sk = ROOT`. A `COMMITTED` decision is final. A missing decision is not evidence of rollback.
@@ -51,6 +53,8 @@ do {
 ```
 
 The limit bounds registry entries examined, not a transaction's logical size. Cleanup progress is durable in the restored records and can be retried after worker interruption. Active transaction records and payloads have no TTL. Once cleanup finishes, the decision receives seven days of retention using the configured TTL attribute, or `ttl` when no attribute is configured. Enable DynamoDB TTL on that attribute to remove completed decision records automatically; otherwise they remain stored. Never independently expire active journal records.
+
+Transaction initialization rejects TTL names that collide with journal fields: `pk`, `sk`, `id`, `state`, `count`, `prepared`, `expires`, and `cleaned`. Use a dedicated attribute such as `ttl`.
 
 The protocol uses existing Get, Query, BatchGet, and TransactWrite permissions. Raw DynamoDB readers, streams, and exports can contain prepared intents and journal records. They do not automatically expose the same logical view as the adapter. Restore the complete table together, including transaction metadata.
 

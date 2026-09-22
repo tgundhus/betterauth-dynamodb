@@ -27,6 +27,11 @@ function changes(count: number): Change[] {
 function updates(command: any): Record<string, any>[] { return command instanceof TransactWriteCommand ? (command.input.TransactItems ?? []).flatMap((action) => action.Update ?? []) : []; }
 
 describe("DynamoDB callback transactions", () => {
+  it("rejects TTL configuration that would overwrite the durable decision", async () => {
+    const db = new MemoryDynamoDB();
+    await expect(initializeDynamoDBTransactions({ tableName: "auth", client: db.asClient(), transactions: true, ttl: { attributeName: "state", fields: {} } })).rejects.toThrow("reserved journal metadata");
+    expect(db.rows.size).toBe(0);
+  });
   it("commits more than 100 physical items and reads its own creates, updates, increments and deletes", async () => {
     const { store, db } = await fixture();
     const result = await store.transaction(async (trx) => {

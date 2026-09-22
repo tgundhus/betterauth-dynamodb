@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 2.0.0-alpha.0 - Unreleased
+
+### Added
+
+- Opt-in callback transactions backed by a durable DynamoDB journal, conditional item preparation, one commit decision, and resumable cleanup. Callbacks read their staged changes and can exceed one native 100-action transaction.
+- Explicit transaction storage initialization and registry-based recovery APIs, with an error carrying the transaction ID when commit outcome cannot be resolved.
+- Published SCIM and SSO HTTP integration contracts covering provisioning, role projection rollback, identity linking, deactivation, session revocation, and guarded provider mutations.
+- A separate large-group and Bulk contract test for the companion SCIM source changes.
+
+### Changed
+
+- The preview requires Better Auth `^1.7.5`. Transaction mode forces strongly consistent reads and removes the default page and IN-cardinality limits while retaining bounded native requests.
+- Transaction-mode storage requires all readers and writers to participate in the new protocol. Existing keys are preserved, but mixed versions and raw table consumers require a migration plan.
+
+This is an unpublished preview. Real AWS load, conflict/recovery testing, and migration rehearsals remain required before production release. Stable 1.2 behavior remains available on `main`.
+
 ## [1.2.0] - 2026-09-21
 
 ### Changed

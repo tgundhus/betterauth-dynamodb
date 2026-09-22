@@ -12,6 +12,7 @@ export type Action = NonNullable<TransactWriteCommandInput["TransactItems"]>[num
 export class Journal {
   readonly codec: JournalCodec;
   constructor(readonly client: DynamoDBDocumentClient, readonly tableName: string, readonly ttlAttribute = "ttl") {
+    validateJournalTtl(ttlAttribute);
     const translate = client.config?.translateConfig;
     this.codec = new JournalCodec(translate?.marshallOptions, translate?.unmarshallOptions);
   }
@@ -121,4 +122,8 @@ function journalRowSize(item: Item): number { return item.bytes ? (item.bytes as
 
 function journalQuery(pk: string, prefix?: string) {
   return { KeyConditionExpression: prefix ? "pk = :pk AND begins_with(sk, :prefix)" : "pk = :pk", ExpressionAttributeValues: { ":pk": pk, ...(prefix ? { ":prefix": prefix } : {}) } };
+}
+
+function validateJournalTtl(attribute: string): void {
+  if (!attribute || ["pk", "sk", "id", "state", "count", "prepared", "expires", "cleaned"].includes(attribute)) throw new DynamoDBAdapterError("Transaction TTL attribute conflicts with reserved journal metadata; configure a separate TTL attribute such as ttl.");
 }

@@ -47,12 +47,14 @@ export async function ssoGuardContract(options: BetterAuthDynamoDBOptions) {
 
 async function exerciseSSO(options: BetterAuthDynamoDBOptions, idp: OAuth2Server) {
   let reject = true;
+  let pauseAfterLink: (() => Promise<void>) | undefined;
   const auth = betterAuth({ baseURL: "http://localhost:3000", secret: "enterprise-sso-test-secret-at-least-32-characters", database: dynamoDBAdapter({ ...options, transactions: true, ttl: { fields: { session: "expiresAt", verification: "expiresAt" } } }), verification: { disableCleanup: true }, trustedOrigins: [idp.issuer.url!],
     plugins: [scim({ connections: [{ id: "workforce", credentials: [{ type: "bearer", id: "test", token: "test-token" }] }] }) as unknown as BetterAuthPlugin,
       sso({ disableImplicitSignUp: true, defaultSSO: [{ domain: "example.com", providerId: "workforce", oidcConfig: { issuer: idp.issuer.url!, clientId: "test-client", clientSecret: "test-secret", pkce: false, discoveryEndpoint: `${idp.issuer.url}/.well-known/openid-configuration` } }],
         async resolveUser(input, context) {
           const link = await acquireActiveSCIMUserLink({ connectionId: "workforce", externalId: input.accountKey.accountId }, context);
           if (!link) return { action: "reject", code: "SCIM_USER_NOT_ACTIVE" };
+          await pauseAfterLink?.();
           if (reject) {
             await context.database.update({ model: "user", where: [{ field: "id", value: link.userId }], update: { name: "must roll back" } });
             throw new Error("injected SSO resolution failure");
@@ -90,8 +92,21 @@ async function exerciseSSO(options: BetterAuthDynamoDBOptions, idp: OAuth2Server
   const session = await (await request("/get-session", "GET", undefined, { cookie: cookieHeader(accepted.cookies) })).json() as any;
   expect(session?.user).toMatchObject({ email: "provisioned@example.com", name: "Provisioned name" });
   expect(await adapter.count({ model: "account", where: [{ field: "providerId", value: "workforce" }] })).toBe(1);
-  const deactivated = await request(`/scim/v2/Users/${provisioned.id}`, "PATCH", { schemas: ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], Operations: [{ op: "replace", path: "active", value: false }] }, scimHeaders);
-  expect(deactivated.status, await deactivated.clone().text()).toBe(200);
+  let linked!: () => void;
+  let resume!: () => void;
+  const linkRead = new Promise<void>((resolve) => { linked = resolve; });
+  const resumed = new Promise<void>((resolve) => { resume = resolve; });
+  pauseAfterLink = async () => { linked(); await resumed; };
+  const racingSignIn = signIn();
+  await linkRead;
+  try {
+    const deactivated = await request(`/scim/v2/Users/${provisioned.id}`, "PATCH", { schemas: ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], Operations: [{ op: "replace", path: "active", value: false }] }, scimHeaders);
+    expect(deactivated.status, await deactivated.clone().text()).toBe(200);
+  } finally { resume(); }
+  const staleSignIn = await racingSignIn;
+  pauseAfterLink = undefined;
+  expect(staleSignIn.callback.headers.get("location")).not.toBe("http://localhost:3000/employee");
+  expect(await (await request("/get-session", "GET", undefined, { cookie: cookieHeader(staleSignIn.cookies) })).json()).toBeNull();
   expect(await (await request("/get-session", "GET", undefined, { cookie: cookieHeader(accepted.cookies) })).json()).toBeNull();
   expect(await adapter.count({ model: "session", where: [{ field: "userId", value: session.user.id }] })).toBe(0);
   const inactive = await signIn();

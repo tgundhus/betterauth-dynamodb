@@ -1,6 +1,26 @@
 # DynamoDB-only enterprise transactions
 
-Status: design proposal. No transaction engine or enterprise compatibility fix is implemented by this document. Version 1.2 continues to report `transaction: false`.
+Status: implemented as an opt-in, unpublished 2.0 preview. Version 1.2 continues to report `transaction: false`. The preview is isolated on `feat/enterprise-transactions`; it is not a production release.
+
+## Implemented and verified
+
+The adapter now supplies callback transactions with staged reads/writes, durable before/after versions, conditional preparation, an immutable commit decision, and resumable recovery. Callbacks can span more than 100 physical items. The official Better Auth transaction conformance suite and the published SCIM/SSO 1.7.5 HTTP contracts pass against DynamoDB Local in CI.
+
+The integration contracts cover SCIM provisioning, group membership, role projection rollback, deletion, OIDC linking to a SCIM user, resolver rejection, sign-in racing deactivation, session revocation, and guarded SSO provider updates/deletes. Unit fault injection covers partial preparation, lost commit acknowledgement, competing ordinary writes, interrupted cleanup, stale read dependencies, and fresh-worker recovery. These results do not establish production service parity or serializable query isolation.
+
+The companion SCIM source changes start at Better Auth tag `v1.7.5`, commit `5468e6bfcdff799848537cf5ad06ebab15aad9dd`. They add optional `groups.maxMembers` and `bulk` configuration, complete internal membership pagination, chunked user lookups, and per-resource Bulk dispatch. The SCIM suite passes 344 tests and the full Better Auth workspace typecheck passes. A combined adapter/plugin contract passes with 1,051 Bulk-created users and a 1,051-member group through create, complete reads, replacement, PATCH, and deletion. That scale run uses the independent DynamoDB command double; it is not an AWS performance benchmark. The companion package is not published; installing `@better-auth/scim@1.7.5` does not enable them.
+
+```ts
+scim({
+  connections: [connection],
+  groups: { maxMembers: null },
+  bulk: { maxOperations: 10_000, maxPayloadSize: 16 * 1024 * 1024 },
+});
+```
+
+`maxMembers` defaults to 1,000 for compatibility; `null` removes the fixed cap. Bulk supports Users and Groups with POST, PUT, PATCH, DELETE, forward `bulkId` dependencies, per-operation authorization and results, and `failOnErrors`. Ordinary text is preserved when references are rewritten. Failed or unresolved dependencies return a conflict. Nested Groups and resource version preconditions remain outside the plugin's supported capabilities. Each resource commits independently; an entire Bulk envelope is not one atomic operation.
+
+Use [the storage guide](./transaction-storage.md) for initialization, migration, recovery, and rollback. The release gates below remain required before declaring the preview ready for production.
 
 ## Requirements
 
@@ -31,11 +51,11 @@ Thus, 13 additions require 104 items and 1,000 additions require 8,000 items, be
 
 There are two independent plugin limits. Version 1.7.5 caps a group at 1,000 direct members and advertises SCIM `/Bulk` as unsupported. Provisioning many users through repeated User and Group requests is a different requirement from the optional SCIM `/Bulk` endpoint. Larger groups or `/Bulk` require plugin work as well as adapter work; an adapter cannot change those HTTP contracts.
 
-## Proposed implementation boundary
+## Implementation boundary
 
 Use an adapter-managed transaction layer backed entirely by DynamoDB. Prefer record-level coordination over a database-wide mutex, which would make a large directory update stall unrelated authentication. Keep the SSO plugin and carry the required SCIM changes in a separate, version-pinned fork or upstream contribution. The SCIM fork should preserve existing authentication, authorization, connection fencing, identity handling, and projection code.
 
-The transaction layer needs three components:
+The transaction layer implements three components:
 
 1. A callback-scoped adapter that stages logical entity changes, overlays them on reads, and collapses repeated changes to each entity into one final state. It must use Better Auth's public adapter factory so schema mapping, dates, selections, and generated IDs remain correct.
 2. Durable transaction records and per-item prepared versions or intents. Entity rows, equality indexes, and unique locks must all participate. Store large manifests in bounded pages; neither a manifest item nor an individual DynamoDB request may exceed AWS limits.
@@ -43,7 +63,7 @@ The transaction layer needs three components:
 
 This is atomic visibility through the adapter, not a claim that AWS atomically writes thousands of physical items. Direct table readers, exports, and stream consumers would need the new protocol or a separately defined committed-change interface. Existing raw table consumers cannot be assumed compatible.
 
-## Protocol that needs implementation and validation
+## Protocol invariants and validation
 
 Use explicit, durable states such as `PREPARING`, `COMMITTED`, and `ABORTED`. A terminal decision must be immutable. Every prepare write must be fenced by the transaction's current state and ownership so a timed-out process cannot resume and mutate data after recovery has aborted it.
 
@@ -67,7 +87,7 @@ Preserve efficient ordinary operations where correctness permits. Measure the ex
 
 Query support is part of compatibility too. Exercise every published SCIM filter and pagination shape, along with the adapter's existing query guards. Do not remove a transaction blocker only to replace it with an unexpected page cap, unsupported query, or partial result. Any new index or scoped query path must have a cost model and migration plan.
 
-## SCIM plugin work
+## Companion SCIM changes
 
 The source is available in [Better Auth's `packages/scim` at v1.7.5](https://github.com/better-auth/better-auth/tree/v1.7.5/packages/scim). There is no public option in that version that enables `/Bulk` or lifts group cardinality. Patching only the request schema would leave other cardinality checks and bounded membership reads unchanged.
 
@@ -86,7 +106,7 @@ Use 1,001-member and 10,000-member groups as initial regression and load-test fi
 
 ## Release gates
 
-The compatibility flag stays disabled until the implementation passes these gates:
+Transaction mode defaults to disabled. Explicit opt-in is available for preview validation; production release still requires these gates:
 
 | Area                      | Required evidence                                                                                                                                                                                         |
 | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -101,13 +121,12 @@ The compatibility flag stays disabled until the implementation passes these gate
 
 Run the repository's full verification and DynamoDB Local integration suites. Local tests are necessary but do not replace targeted AWS validation for this storage and concurrency change. Passing the plugin's initialization check alone is not compatibility evidence.
 
-## Implementation order
+## Remaining release work
 
-1. Build and fault-test the transaction protocol independently, including competing writers and recovery. Prove that only a durable commit decision exposes prepared data.
-2. Integrate all adapter reads and writes, add migration and recovery tooling, and pass Better Auth's transaction conformance suite.
-3. Exercise the unmodified SCIM and SSO packages against that implementation, including lifecycle and sign-in races.
-4. Extend the separate SCIM source package for larger groups and `/Bulk`, retaining its existing tests and adding the cases above.
-5. Benchmark ordinary authentication and large provisioning, validate deployment limits, and complete a migration rehearsal before declaring compatibility.
+1. Publish a reviewable, pinned companion SCIM source revision and run the combined large-group/Bulk contract against DynamoDB Local, including role projection and decommissioning at scale.
+2. Expand concurrent SCIM deactivation, group mutation, and sign-in tests to validate the plugin's revision fences under the adapter's optimistic conflicts. Query predicates do not receive SQL-style range locks.
+3. Run 10,000-member workloads and real AWS fault/load tests, measuring latency, requests, consumed capacity, bytes, contention, and cleanup cost. Configure runtime and proxy limits using those measurements.
+4. Rehearse migration, backup/restore, recovery, and rollback with all readers/writers coordinated. Validate any stream consumers separately.
 
 ## Sources
 
