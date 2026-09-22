@@ -2,6 +2,13 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      members:
+        description: Members in the DynamoDB Local provisioning load fixture
+        type: choice
+        options: ['1051', '10000']
+        default: '10000'
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -31,9 +38,9 @@ jobs:
       - run: docker pull amazon/dynamodb-local:2.6.1
       - run: bun run test:integration:local
   enterprise-scale:
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -70,4 +77,5 @@ jobs:
         env:
           SCIM_PREVIEW_MODULE: node_modules/.scim-enterprise-preview/index.mjs
           SCIM_PREVIEW_DYNAMODB: '1'
+          SCIM_SCALE_MEMBERS: ${{ inputs.members || '1051' }}
         run: node node_modules/vitest/vitest.mjs run --config vitest.preview.config.ts
