@@ -1,0 +1,32 @@
+import { marshall, unmarshall } from "@aws-sdk/util-dynamodb";
+import type { marshallOptions, unmarshallOptions } from "@aws-sdk/util-dynamodb";
+import type { Item } from "./types.js";
+
+/** AWS attribute-value JSON preserves sets, binary, and large numbers across process/runtime restarts. */
+export class JournalCodec {
+  constructor(private readonly marshal?: marshallOptions, private readonly unmarshal?: unmarshallOptions) {}
+
+  encode(item: Item | null): Uint8Array[] {
+    if (item === null) return [];
+    const bytes = Buffer.from(JSON.stringify(marshall(item, this.marshal), binaryReplacer));
+    const size = 128 * 1024;
+    return Array.from({ length: Math.ceil(bytes.length / size) }, (_, part) => bytes.subarray(part * size, (part + 1) * size));
+  }
+
+  decode(parts: Uint8Array[]): Item | null {
+    if (parts.length === 0) return null;
+    return unmarshall(JSON.parse(Buffer.concat(parts).toString("utf8"), binaryReviver), this.unmarshal);
+  }
+}
+
+function binaryReplacer(this: Record<string, unknown>, key: string, value: unknown): unknown {
+  const original = this[key];
+  if (ArrayBuffer.isView(original)) return Buffer.from(original.buffer, original.byteOffset, original.byteLength).toString("base64");
+  return value;
+}
+
+function binaryReviver(key: string, value: unknown): unknown {
+  if (key === "B" && typeof value === "string") return Buffer.from(value, "base64");
+  if (key === "BS" && Array.isArray(value)) return value.map((part: string) => Buffer.from(part, "base64"));
+  return value;
+}

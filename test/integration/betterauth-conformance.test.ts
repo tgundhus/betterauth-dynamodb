@@ -13,11 +13,12 @@ import {
   caseInsensitiveTestSuite,
   normalTestSuite,
   testAdapter,
+  transactionsTestSuite,
   uuidTestSuite
 } from "@better-auth/test-utils/adapter";
 import { randomUUID } from "node:crypto";
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
-import { dynamoDBAdapter } from "../../src/index.js";
+import { dynamoDBAdapter, initializeDynamoDBTransactions } from "../../src/index.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 
 const IMAGE = "amazon/dynamodb-local:2.6.1";
@@ -33,7 +34,7 @@ await startDynamoDBLocal();
 
 const conformance = await testAdapter({
   adapter: () => dynamoDBAdapter(adapterOptions()),
-  runMigrations: () => createTable(nativeClient, tableName),
+  runMigrations: async () => { await createTable(nativeClient, tableName); await initializeDynamoDBTransactions(adapterOptions()); },
   onFinish: async () => {
     await deleteTable(nativeClient, tableName);
     nativeClient.destroy();
@@ -55,10 +56,9 @@ const conformance = await testAdapter({
     caseInsensitiveTestSuite(),
     // Included: exercises Better Auth's public auth flows against the adapter. Verification cleanup is disabled
     // above because Better Auth's range-only cleanup is an unsupported scan-shaped production access pattern.
-    authFlowTestSuite()
+    authFlowTestSuite(),
+    transactionsTestSuite()
     // Excluded: numberIdTestSuite because supportsNumericIds=false.
-    // Excluded: transactionsTestSuite because config.transaction=false and DynamoDB cannot support Better Auth's
-    // arbitrary callback transaction contract honestly.
     // Excluded: joinsTestSuite because experimental native joins are rejected; Better Auth fallback joins are
     // covered by the normal/UUID suites, while native join tests would conflict with the adapter invariant.
   ],
@@ -72,6 +72,7 @@ function adapterOptions(): BetterAuthDynamoDBOptions {
     tableName,
     client: docClient,
     unsafeAllowScan: true,
+    transactions: true,
     maxPages: 100
   };
 }

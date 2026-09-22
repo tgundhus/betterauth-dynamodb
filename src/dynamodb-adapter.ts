@@ -14,6 +14,10 @@ import { entitySk, indexPk, modelPk } from "./keys.js";
 import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, revisionOf, stripUndefined, toIndexSidecars, toSchemaUniqueLocks, toStoredItem, toUniqueLocks, ttlAttribute } from "./serialize.js";
 import type { CleanedWhere, DynamoDBStoreOptions, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types.js";
 import { eqWhere, firstEquality, inWhere, matchesWhere, planQuery, safeInWhere, scalarValues } from "./where.js";
+import { CallbackContext } from "./transactions/context.js";
+import { TransactionEngine } from "./transactions/engine.js";
+import { Journal } from "./transactions/journal.js";
+import { participatingClient } from "./transactions/client.js";
 
 const MAX_TRANSACT_ITEMS = 100;
 const MAX_IN_VALUES = 1000;
@@ -23,15 +27,34 @@ const MAX_BATCH_GET_STALLED_ATTEMPTS = 8;
 export class DynamoDBStore {
   private readonly client: DynamoDBDocumentClient;
   private readonly options: ReturnType<typeof normalizeOptions<DynamoDBStoreOptions>>;
+  private readonly engine: TransactionEngine | undefined;
+  private readonly context: CallbackContext | undefined;
 
   constructor(options: DynamoDBStoreOptions) {
-    this.options = normalizeOptions(options);
-    this.client = createDocumentClient(this.options);
+    this.options = normalizeOptions(transactionOptions(options));
+    const raw = createDocumentClient(this.options);
+    this.engine = storeEngine(options, raw);
+    this.context = options.transactionContext;
+    const client = this.engine && !options.transactionEngine ? participatingClient(raw, this.engine) : raw;
+    this.client = this.context ? this.context.client(client) : client;
+  }
+
+  async transaction<R>(callback: (store: DynamoDBStore) => Promise<R>): Promise<R> {
+    if (this.context) return callback(this);
+    if (!this.engine) throw new DynamoDBAdapterError("Callback transactions are not enabled.");
+    const context = new CallbackContext(this.engine, (item) => this.allSidecars(item.model, item.entity));
+    const scoped = new DynamoDBStore({ ...this.options, client: this.client, transactionContext: context, transactionEngine: this.engine });
+    try {
+      const result = await callback(scoped);
+      await context.commit();
+      return result;
+    } finally { context.close(); }
   }
 
   async create<T extends Record<string, unknown>>(model: string, data: T): Promise<T> {
     const item = toStoredItem(model, data, this.options.ttl);
-    await this.transactPutNew([item, ...this.allSidecars(model, data)], "create");
+    if (this.context) await this.context.create(item, this.client);
+    else await this.transactPutNew([item, ...this.allSidecars(model, data)], "create");
     return fromStoredItem<T>(item, this.options.ttl) as T;
   }
 
@@ -131,6 +154,13 @@ export class DynamoDBStore {
   }
 
   private async loadRows(model: string, plan: QueryPlan, take?: number): Promise<StoredItem[]> {
+    if (!this.context) return this.loadRawRows(model, plan, take);
+    const rows = await this.loadRawRows(model, plan);
+    const matches = visibleRows(this.context.overlay(model, rows), this.options.ttl).filter((row) => matchesWhere(row, plan.where));
+    return transactionReadOrder(matches, plan);
+  }
+
+  private async loadRawRows(model: string, plan: QueryPlan, take?: number): Promise<StoredItem[]> {
     if (plan.kind === "byId") return this.loadById(model, plan.where);
     if (plan.kind === "byIdValues") return this.loadByIds(model, plan.where);
     if (plan.kind === "byFieldValue") return this.loadByField(model, plan.where, take);
@@ -174,6 +204,7 @@ export class DynamoDBStore {
   }
 
   async transactCreate(items: { model: string; data: Record<string, unknown> }[]): Promise<void> {
+    if (this.context) { for (const item of items) await this.create(item.model, item.data); return; }
     await this.transactPutNew(items.flatMap((item) => [toStoredItem(item.model, item.data, this.options.ttl), ...this.allSidecars(item.model, item.data)]), "transactCreate");
   }
 
@@ -189,6 +220,7 @@ export class DynamoDBStore {
   }
 
   private async transactReplace(model: string, oldItem: StoredItem, newItem: StoredItem): Promise<void> {
+    if (this.context) { this.context.replace(oldItem, newItem); return; }
     const oldSidecars = this.allSidecars(model, oldItem.entity);
     const newSidecars = this.allSidecars(model, newItem.entity);
     const deletes = removedSidecars(oldSidecars, newSidecars).map((item) => deleteOf(this.options.tableName, item));
@@ -202,6 +234,7 @@ export class DynamoDBStore {
   }
 
   private async transactDelete(item: StoredItem): Promise<void> {
+    if (this.context) { this.context.replace(item, null); return; }
     const condition = revisionCondition(item);
     const entity = { Delete: { TableName: this.options.tableName, Key: keyOf(item), ConditionExpression: condition.expression, ExpressionAttributeNames: condition.names, ExpressionAttributeValues: condition.values, ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const } };
     const sidecars = this.allSidecars(String(item.model), item.entity).map((sidecar) => deleteOf(this.options.tableName, sidecar));
@@ -211,6 +244,7 @@ export class DynamoDBStore {
   }
 
   private async transactIncrement(model: string, oldItem: StoredItem, newItem: StoredItem, increment: Record<string, number>, set: Record<string, unknown>): Promise<void> {
+    if (this.context) { this.context.replace(oldItem, newItem); return; }
     const oldSidecars = this.allSidecars(model, oldItem.entity);
     const newSidecars = this.allSidecars(model, newItem.entity);
     const actions = [incrementUpdateOf(this.options.tableName, oldItem, newItem, increment, set, this.options.ttl), ...removedSidecars(oldSidecars, newSidecars).map((item) => deleteOf(this.options.tableName, item)), ...addedSidecars(oldSidecars, newSidecars).map((item) => putNewOf(this.options.tableName, item)), ...retainedSidecars(oldSidecars, newSidecars).flatMap(([oldSidecar, newSidecar]) => ttlUpdateOf(this.options.tableName, oldSidecar, newSidecar, this.options.ttl))];
@@ -262,7 +296,7 @@ export class DynamoDBStore {
     const clause = inWhere(where, "id");
     if (!clause) return [];
     const ids = [...new Set(scalarValues(clause).map(String))];
-    assertInValueCount(ids.length);
+    this.assertInValues(ids.length);
     return this.batchGetRows(ids.map((id) => ({ pk: modelPk(model), sk: entitySk(id) })));
   }
 
@@ -270,12 +304,30 @@ export class DynamoDBStore {
     const clause = safeInWhere(where);
     if (!clause) return [];
     const values = [...new Map(scalarValues(clause).map((value) => [JSON.stringify([typeof value, value instanceof Date ? value.toISOString() : value]), value])).values()];
-    assertInValueCount(values.length);
+    this.assertInValues(values.length);
     const budget = { remaining: this.options.maxPages };
     const pages = await mapBounded(values, this.options.maxBulkConcurrency, (value) => this.queryAllSidecars(model, { ...clause, operator: "eq", value } as CleanedWhere, budget));
     const unique = new Map(pages.flat().map((item) => [sidecarKey(item), item]));
     return this.loadOwners([...unique.values()], clause);
   }
+
+  private assertInValues(count: number): void { if (!this.engine) assertInValueCount(count); }
+}
+
+function transactionOptions(options: DynamoDBStoreOptions): DynamoDBStoreOptions {
+  return options.transactions ? { ...options, consistentRead: true, maxPages: options.maxPages ?? Number.MAX_SAFE_INTEGER } : options;
+}
+
+function storeEngine(options: DynamoDBStoreOptions, raw: DynamoDBDocumentClient): TransactionEngine | undefined {
+  if (options.transactionEngine) return options.transactionEngine;
+  return options.transactions ? new TransactionEngine(new Journal(raw, options.tableName, ttlAttribute(options.ttl))) : undefined;
+}
+
+function transactionReadOrder(rows: StoredItem[], plan: QueryPlan): StoredItem[] {
+  if (plan.kind !== "byIdValues") return rows;
+  const clause = inWhere(plan.where, "id")!;
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  return [...new Set(scalarValues(clause).map(String))].flatMap((id) => byId.get(id) ?? []);
 }
 
 function keyOf(item: Pick<StoredItem, "pk" | "sk">): { pk: string; sk: string } {

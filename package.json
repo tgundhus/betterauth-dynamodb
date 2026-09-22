@@ -1,6 +1,6 @@
 {
   "name": "@bjorntech/betterauth-dynamodb",
-  "version": "1.2.0",
+  "version": "2.0.0-alpha.0",
   "description": "Production-oriented Better Auth DynamoDB adapter",
   "keywords": [
     "better-auth",
@@ -14,12 +14,12 @@
   "types": "./dist/index.d.ts",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bjorntech/betterauth-dynamodb.git"
+    "url": "git+https://github.com/tgundhus/betterauth-dynamodb.git"
   },
-  "homepage": "https://github.com/bjorntech/betterauth-dynamodb#readme",
+  "homepage": "https://github.com/tgundhus/betterauth-dynamodb#readme",
   "readmeFilename": "README.md",
   "bugs": {
-    "url": "https://github.com/bjorntech/betterauth-dynamodb/issues"
+    "url": "https://github.com/tgundhus/betterauth-dynamodb/issues"
   },
   "publishConfig": {
     "access": "public"
@@ -34,6 +34,7 @@
     "dist",
     "README.md",
     "CHANGELOG.md",
+    "docs",
     "LICENSE"
   ],
   "scripts": {
@@ -51,11 +52,12 @@
     "prepack": "bun run build"
   },
   "peerDependencies": {
-    "better-auth": "^1.6.25"
+    "better-auth": "^1.7.5"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.758.0",
-    "@aws-sdk/lib-dynamodb": "^3.758.0"
+    "@aws-sdk/lib-dynamodb": "^3.758.0",
+    "@aws-sdk/util-dynamodb": "^3.996.7"
   },
   "devDependencies": {
     "@babel/parser": "^7.28.0",

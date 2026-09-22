@@ -1,0 +1,169 @@
+import { randomUUID } from "node:crypto";
+import { DynamoDBAdapterError, DynamoDBConflictError, isConditionalTransactionCanceled } from "../errors.js";
+import { chunks, dataPk, INTENT, keyId, LEASE_MS, ownedGuard, placeholder, rootKey, snapshotGuard, versioned, intentOf } from "./format.js";
+import type { Journal } from "./journal.js";
+import type { Action } from "./journal.js";
+import type { Change, Decision, Entry, Intent, Item, Key } from "./types.js";
+
+export class DynamoDBTransactionOutcomeUnknownError extends DynamoDBAdapterError {
+  constructor(readonly transactionId: string, cause: unknown) {
+    super(`DynamoDB transaction ${transactionId} has an unknown outcome. Resolve its durable decision before retrying the logical mutation.`, { cause });
+  }
+}
+
+export class TransactionEngine {
+  constructor(readonly journal: Journal) {}
+
+  async commit(input: Change[]): Promise<void> {
+    if (input.length === 0) return;
+    const changes = validateChanges(input);
+    const id = randomUUID();
+    await this.journal.start(id, changes.length);
+    try {
+      await this.journal.save(id, changes);
+      await this.prepare(id, changes);
+      await this.decide(id, changes.length);
+    } catch (error) {
+      if (!await this.committedOrAbort(id, error)) {
+        await this.tryRecover(id);
+        throw error;
+      }
+    }
+    // A cleanup failure cannot turn an already committed callback into a rollback.
+    // The durable registry retains it for the application's recovery worker.
+    await this.tryRecover(id);
+  }
+
+  private async prepare(id: string, changes: Change[]): Promise<void> {
+    let prepared = 0;
+    for (const batch of chunks(changes, 99)) {
+      const puts = batch.map((change, offset): Action => ({ Put: { TableName: this.journal.tableName, Item: placeholder(id, prepared + offset, change.key), ...snapshotGuard(change) } }));
+      await this.journal.send([this.progress(id, prepared, batch.length), ...puts]);
+      prepared += batch.length;
+    }
+  }
+
+  private progress(id: string, before: number, count: number): Action {
+    return { Update: { TableName: this.journal.tableName, Key: rootKey(id), UpdateExpression: "SET prepared = :after, expires = :expires", ConditionExpression: "#state = :preparing AND prepared = :before", ExpressionAttributeNames: { "#state": "state" }, ExpressionAttributeValues: { ":after": before + count, ":expires": Date.now() + LEASE_MS, ":preparing": "PREPARING", ":before": before } } };
+  }
+
+  private async decide(id: string, count: number): Promise<void> {
+    await this.journal.send([{ Update: { TableName: this.journal.tableName, Key: rootKey(id), UpdateExpression: "SET #state = :committed", ConditionExpression: "#state = :preparing AND prepared = :count", ExpressionAttributeNames: { "#state": "state" }, ExpressionAttributeValues: { ":preparing": "PREPARING", ":committed": "COMMITTED", ":count": count } } }]);
+  }
+
+  private async committedOrAbort(id: string, original: unknown): Promise<boolean> {
+    try {
+      const decision = await this.journal.decision(id);
+      if (!decision) throw new DynamoDBAdapterError("The transaction decision is missing.");
+      if (decision?.state === "COMMITTED") return true;
+      await this.abort(id);
+      return (await this.journal.decision(id))?.state === "COMMITTED";
+    } catch (cause) {
+      throw new DynamoDBTransactionOutcomeUnknownError(id, { original, cause });
+    }
+  }
+
+  private async abort(id: string, expiredOnly = false): Promise<void> {
+    const condition = expiredOnly ? "#state = :preparing AND expires <= :now" : "#state = :preparing";
+    try {
+      await this.journal.send([{ Update: { TableName: this.journal.tableName, Key: rootKey(id), UpdateExpression: "SET #state = :aborted", ConditionExpression: condition, ExpressionAttributeNames: { "#state": "state" }, ExpressionAttributeValues: { ":preparing": "PREPARING", ":aborted": "ABORTED", ...(expiredOnly ? { ":now": Date.now() } : {}) } } }]);
+    } catch (error) { if (!isConditionalTransactionCanceled(error)) throw error; }
+  }
+
+  async resolve(item: Item | null, key: Key): Promise<Item | null> {
+    let current = item;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const intent = intentOf(current);
+      if (!intent) return current;
+      const value = await this.resolveIntent(intent);
+      if (value !== undefined) return value;
+      current = await this.journal.get(key);
+    }
+    throw new DynamoDBAdapterError("DynamoDB transaction metadata could not be resolved. The target has been retained; run transaction recovery or repair the journal.");
+  }
+
+  private async resolveIntent(intent: Intent): Promise<Item | null | undefined> {
+    const decision = await this.journal.decision(intent.id);
+    if (!decision) return undefined;
+    const entry = await this.journal.entry(intent.id, intent.entry);
+    if (!entry) return undefined;
+    try { return await this.journal.payload(intent.id, intent.entry, entry, decision.state === "COMMITTED" ? "after" : "before"); }
+    catch (error) { if (error instanceof DynamoDBAdapterError) return undefined; throw error; }
+  }
+
+  async recover(id: string): Promise<boolean> {
+    const decision = await this.recoveryDecision(id);
+    if (!decision) return true;
+    if (decision.state === "PREPARING") return false;
+    await this.restoreEntries(decision);
+    await this.journal.purge(id);
+    return true;
+  }
+
+  /** Ordinary writes help release terminal intents and wait for live owners without stealing their locks. */
+  async release(key: Key): Promise<void> {
+    while (true) {
+      const intent = intentOf(await this.journal.get(key));
+      if (!intent) return;
+      const decision = await this.recoveryDecision(intent.id);
+      if (!decision) throw new DynamoDBAdapterError("A prepared item has no durable transaction decision.");
+      if (decision.state !== "PREPARING") await this.releaseEntry(intent, decision);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  private async releaseEntry(intent: Intent, decision: Decision): Promise<void> {
+    const entry = await this.journal.entry(intent.id, intent.entry);
+    if (!entry) throw new DynamoDBAdapterError("A prepared item has no journal entry.");
+    await this.restore(decision, intent.entry, entry);
+  }
+
+  private async recoveryDecision(id: string): Promise<Decision | null> {
+    const decision = await this.journal.decision(id);
+    if (!decision) return null;
+    if (decision.state !== "PREPARING" || decision.expires > Date.now()) return decision;
+    await this.abort(id, true);
+    return this.journal.decision(id);
+  }
+
+  private async restoreEntries(decision: Decision): Promise<void> {
+    for await (const row of this.journal.rows(dataPk(decision.id))) {
+      if (!String(row.sk).startsWith("E#")) continue;
+      await this.restore(decision, Number(String(row.sk).slice(2)), row as Entry);
+    }
+  }
+
+  private async restore(decision: Decision, index: number, entry: Entry): Promise<void> {
+    if (!ownedBy(await this.journal.get(entry.target), decision.id, index)) return;
+    const value = await this.journal.payload(decision.id, index, entry, decision.state === "COMMITTED" ? "after" : "before");
+    const target = this.restoreAction(decision.id, index, entry.target, value);
+    try { await this.journal.send([this.journal.terminalGuard(decision.id), target]); }
+    catch (error) { if (ownedBy(await this.journal.get(entry.target), decision.id, index)) throw error; }
+  }
+
+  private restoreAction(id: string, index: number, key: Key, item: Item | null): Action {
+    const guard = { TableName: this.journal.tableName, ...ownedGuard(id, index) };
+    return item ? { Put: { ...guard, Item: item } } : { Delete: { ...guard, Key: key } };
+  }
+
+  private async tryRecover(id: string): Promise<void> {
+    try { await this.recover(id); } catch { /* Registry is durable; explicit recovery retries this work. */ }
+  }
+}
+
+function ownedBy(item: Item | null, id: string, entry: number): boolean {
+  const intent = intentOf(item);
+  return intent?.id === id && intent.entry === entry;
+}
+
+function validateChanges(input: Change[]): Change[] {
+  const keys = input.map((change) => keyId(change.key));
+  if (new Set(keys).size !== keys.length) throw new DynamoDBAdapterError("Transaction changes contain duplicate physical keys.");
+  return input.map(prepareChange);
+}
+
+function prepareChange(change: Change): Change {
+  if (change.before?.[INTENT] || change.after?.[INTENT]) throw new DynamoDBConflictError("Transaction changes must use resolved committed records.");
+  if (change.before === change.after || !change.after) return change;
+  return { ...change, after: versioned(change.after) };
+}

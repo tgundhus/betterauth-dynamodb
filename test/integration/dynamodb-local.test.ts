@@ -12,7 +12,9 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { GenericContainer, type StartedTestContainer, Wait } from "testcontainers";
 import { betterAuth } from "better-auth";
 import { oauthProvider } from "@better-auth/oauth-provider";
-import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter } from "../../src/index.js";
+import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dynamoDBAdapter, initializeDynamoDBTransactions, recoverDynamoDBTransactions } from "../../src/index.js";
+import { DynamoDBStore } from "../../src/dynamodb-adapter.js";
+import { INTENT } from "../../src/transactions/format.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 import { compoundUniqueIndexName, compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../../src/serialize.js";
@@ -60,6 +62,35 @@ describe("DynamoDB Local adapter integration", () => {
 
   afterEach(async () => {
     await deleteTable(nativeClient, tableName);
+  });
+
+  it("atomically commits a callback spanning more than 1,000 physical items", async () => {
+    const options = { tableName, client: docClient, transactions: true, uniqueFields: { member: ["membershipKey"] } };
+    await initializeDynamoDBTransactions(options);
+    const store = new DynamoDBStore(options);
+    await store.transaction(async (trx) => {
+      for (let index = 0; index < 145; index++) await trx.create("member", { id: `member-${index}`, connectionId: "c", groupId: "g", scimUserId: `user-${index}`, membershipKey: `membership-${index}`, createdAt: "2026-01-01T00:00:00.000Z" });
+      expect(await trx.count("member", [eq("groupId", "g")])).toBe(145);
+      expect(await store.count("member", [eq("groupId", "g")])).toBe(0);
+    });
+    expect(await store.count("member", [eq("groupId", "g")])).toBe(145);
+    expect(await recoverDynamoDBTransactions(options)).toMatchObject({ examined: 0 });
+    expect((await rawRow(modelPk("member"), entitySk("member-0")))?.[INTENT]).toBeUndefined();
+  });
+
+  it("restores every prepared item when a later callback prepare batch fails", async () => {
+    const broken = { send: async (command: any) => {
+      if (command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Update?.ExpressionAttributeValues?.[":before"] === 99)) throw new Error("injected prepare failure");
+      return docClient.send(command);
+    } } as unknown as DynamoDBDocumentClient;
+    const options = { tableName, client: broken, transactions: true };
+    await initializeDynamoDBTransactions(options);
+    const store = new DynamoDBStore(options);
+    await expect(store.transaction(async (trx) => {
+      for (let index = 0; index < 55; index++) await trx.create("member", { id: `member-${index}`, groupId: "g" });
+    })).rejects.toThrow("injected prepare failure");
+    expect(await store.count("member", [eq("groupId", "g")])).toBe(0);
+    expect(await recoverDynamoDBTransactions(options)).toMatchObject({ examined: 0 });
   });
 
   it("creates and reads by id through an injected DynamoDBDocumentClient", async () => {
