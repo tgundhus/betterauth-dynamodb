@@ -3,7 +3,7 @@ import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBConflictError } from "../errors.js";
 import { REVISION_ATTRIBUTE } from "../serialize.js";
 import type { SidecarItem, StoredItem } from "../types.js";
-import { keyId, keyOf, PHYSICAL_VERSION } from "./format.js";
+import { chunks, intentOf, keyId, keyOf, PHYSICAL_VERSION } from "./format.js";
 import type { TransactionEngine } from "./engine.js";
 import type { Change, Item, Key } from "./types.js";
 
@@ -96,7 +96,8 @@ export class CallbackContext {
     this.closed = true;
     const changes: Change[] = [...this.observations].map(([id, observed]) => ({ key: observed.key, before: observed.item, after: this.writes.has(id) ? this.writes.get(id)! : observed.item }));
     const sides = this.sidecarChanges();
-    for (const side of sides) changes.push(await this.resolveSidecar(side));
+    const snapshots = await this.engine.journal.getMany(sides.map((side) => side.key));
+    for (const batch of chunks(sides, 16)) changes.push(...await Promise.all(batch.map((side) => this.resolveSidecar(side, snapshots.get(keyId(side.key)) ?? null))));
     await this.engine.commit(changes);
   }
 
@@ -123,9 +124,12 @@ export class CallbackContext {
     }
   }
 
-  private async resolveSidecar(change: SidecarChange): Promise<Change> {
-    await this.engine.release(change.key);
-    const before = await this.engine.journal.get(change.key);
+  private async resolveSidecar(change: SidecarChange, snapshot: Item | null): Promise<Change> {
+    let before = snapshot;
+    if (intentOf(before)) {
+      await this.engine.release(change.key);
+      before = await this.engine.journal.get(change.key);
+    }
     if (before && !allowedOwner(before, change.before)) this.fail("A transaction conflicts with an existing index or unique-value owner.");
     return { key: change.key, before, after: change.after };
   }

@@ -222,3 +222,17 @@ it("keeps the durable journal format stable when DocumentClient mutates its tran
   expect(codec.decode(before)).toEqual({ pk: item.pk, sk: item.sk, nested: { value: "ok" } });
   expect(codec.decode(codec.encode(item))).toEqual(codec.decode(before));
 });
+
+it("rejects oversized final items before preparing or publishing a transaction", async () => {
+  const db = new MemoryDynamoDB();
+  const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+  const [change] = changes(1);
+  await expect(engine.commit([{ ...change!, after: { ...change!.after, text: "é".repeat(210_000) } }])).rejects.toThrow("400 KiB");
+  expect(db.rows.size).toBe(0);
+  const codec = engine.journal.codec;
+  expect(codec.validate({ text: "ok", binary: Buffer.from([1, 2]), yes: true, empty: null, number: 3, list: ["a", { b: true }], ss: new Set(["ab"]), ns: new Set([4]), bs: new Set([Buffer.from([3])]) })).toBeGreaterThan(60);
+  expect(codec.validate(null)).toBe(0);
+  await engine.commit([{ ...change!, after: { ...change!.after, text: "x".repeat(390_000) } }]);
+  expect(db.get(change!.key)?.text).toHaveLength(390_000);
+  expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
+});

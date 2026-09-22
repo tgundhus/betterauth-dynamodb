@@ -17,6 +17,7 @@ export class TransactionEngine {
   async commit(input: Change[]): Promise<void> {
     if (input.length === 0) return;
     const changes = validateChanges(input);
+    for (const change of changes) this.journal.codec.validate(change.after);
     const id = randomUUID();
     await this.journal.start(id, changes.length);
     try {
@@ -127,10 +128,34 @@ export class TransactionEngine {
   }
 
   private async restoreEntries(decision: Decision): Promise<void> {
-    for await (const row of this.journal.rows(dataPk(decision.id))) {
-      if (!String(row.sk).startsWith("E#")) continue;
-      await this.restore(decision, Number(String(row.sk).slice(2)), row as Entry);
+    let entries: { entry: Entry; index: number }[] = [];
+    let bytes = 0;
+    for await (const row of this.journal.rows(dataPk(decision.id), "E#")) {
+      const entry = row as Entry;
+      // Encoded payload bytes conservatively bound native item bytes.
+      const size = (entry.before + entry.after) * 128 * 1024 + 1024;
+      if (entries.length === 99 || bytes + size > 3_000_000) { await this.restoreBatch(decision, entries); entries = []; bytes = 0; }
+      entries.push({ entry, index: Number(String(row.sk).slice(2)) });
+      bytes += size;
     }
+    if (entries.length) await this.restoreBatch(decision, entries);
+  }
+
+  private async restoreBatch(decision: Decision, entries: { entry: Entry; index: number }[]): Promise<void> {
+    const rows = await this.journal.getMany(entries.map(({ entry }) => entry.target));
+    const owned = entries.filter(({ entry, index }) => ownedBy(rows.get(keyId(entry.target)) ?? null, decision.id, index));
+    if (!owned.length) return;
+    const values = await this.journal.payloads(decision.id, owned, decision.state === "COMMITTED" ? "after" : "before");
+    const actions = owned.map(({ entry, index }, position) => this.restoreAction(decision.id, index, entry.target, values[position]!));
+    try { await this.journal.send([this.journal.terminalGuard(decision.id), ...actions]); }
+    catch (error) {
+      if (!isConditionalTransactionCanceled(error)) throw error;
+      await this.restoreIndividually(decision, owned);
+    }
+  }
+
+  private async restoreIndividually(decision: Decision, entries: { entry: Entry; index: number }[]): Promise<void> {
+    for (const { entry, index } of entries) await this.restore(decision, index, entry);
   }
 
   private async restore(decision: Decision, index: number, entry: Entry): Promise<void> {

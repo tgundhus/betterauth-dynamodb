@@ -18,6 +18,7 @@ import { INTENT } from "../../src/transactions/format.js";
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 import { compoundUniqueIndexName, compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../../src/serialize.js";
+import { enterpriseContract } from "../helpers/enterprise-contract.js";
 
 const IMAGE = "amazon/dynamodb-local:2.6.1";
 const REGION = "us-east-1";
@@ -100,6 +101,10 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(adapter.findOne({ model: "user", where: [eq("id", "u1")] })).resolves.toMatchObject({ id: "u1", email: "a@example.com", name: "Ada" });
 
     await expect(rawRow(modelPk("user"), entitySk("u1"))).resolves.toMatchObject({ model: "user", entity: { id: "u1", email: "a@example.com" } });
+  });
+
+  it("runs published SCIM provisioning and projection rollback entirely on DynamoDB", async () => {
+    await enterpriseContract({ tableName, client: docClient });
   });
 
   it("maintains multiple scalar plugin-like equality sidecars in one table", async () => {

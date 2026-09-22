@@ -2,8 +2,9 @@ import { GetCommand, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dyn
 import type { DynamoDBDocumentClient, TransactWriteCommandInput } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
 import { DynamoDBAdapterError } from "../errors.js";
+import { batchGetAttempts } from "../batch-get.js";
 import { JournalCodec } from "./codec.js";
-import { blobKey, dataPk, entryKey, keyOf, LEASE_MS, registryKey, rootKey } from "./format.js";
+import { blobKey, chunks, dataPk, entryKey, keyId, keyOf, LEASE_MS, registryKey, rootKey } from "./format.js";
 import type { Change, Decision, Entry, Item, Key } from "./types.js";
 
 export type Action = NonNullable<TransactWriteCommandInput["TransactItems"]>[number];
@@ -17,6 +18,13 @@ export class Journal {
 
   async get(key: Key): Promise<Item | null> {
     return (await this.client.send(new GetCommand({ TableName: this.tableName, Key: key, ConsistentRead: true }))).Item ?? null;
+  }
+
+  async getMany(keys: Key[]): Promise<Map<string, Item>> {
+    const rows: Item[] = [];
+    const unique = [...new Map(keys.map((key) => [keyId(key), key])).values()];
+    for (const batch of chunks(unique, 100)) rows.push(...await batchGetAttempts<Item>(this.client, this.tableName, batch, true));
+    return new Map(rows.map((row) => [keyId(keyOf(row)), row]));
   }
 
   async decision(id: string): Promise<Decision | null> { return await this.get(rootKey(id)) as Decision | null; }
@@ -62,15 +70,19 @@ export class Journal {
   async entry(id: string, index: number): Promise<Entry | null> { return await this.get(entryKey(id, index)) as Entry | null; }
 
   async payload(id: string, index: number, entry: Entry, side: "before" | "after"): Promise<Item | null> {
-    const parts: Uint8Array[] = [];
-    for (let part = 0; part < entry[side]; part++) parts.push(requireBlob(await this.get(blobKey(id, index, side, part))));
-    return this.codec.decode(parts);
+    return (await this.payloads(id, [{ entry, index }], side))[0]!;
   }
 
-  async *rows(pk: string): AsyncGenerator<Item> {
+  async payloads(id: string, entries: { entry: Entry; index: number }[], side: "before" | "after"): Promise<(Item | null)[]> {
+    const keys = entries.map(({ entry, index }) => Array.from({ length: entry[side] }, (_, part) => blobKey(id, index, side, part)));
+    const rows = await this.getMany(keys.flat());
+    return keys.map((parts) => this.codec.decode(parts.map((key) => requireBlob(rows.get(keyId(key)) ?? null))));
+  }
+
+  async *rows(pk: string, prefix?: string): AsyncGenerator<Item> {
     let cursor: Record<string, unknown> | undefined;
     do {
-      const result = await this.client.send(new QueryCommand({ TableName: this.tableName, KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": pk }, ConsistentRead: true, Limit: 50, ...(cursor ? { ExclusiveStartKey: cursor } : {}) }));
+      const result = await this.client.send(new QueryCommand({ TableName: this.tableName, ...journalQuery(pk, prefix), ConsistentRead: true, Limit: 50, ...(cursor ? { ExclusiveStartKey: cursor } : {}) }));
       for (const row of result.Items ?? []) yield row;
       cursor = result.LastEvaluatedKey;
     } while (cursor);
@@ -106,3 +118,7 @@ function requireBlob(item: Item | null): Uint8Array {
 }
 
 function journalRowSize(item: Item): number { return item.bytes ? (item.bytes as Uint8Array).byteLength + 4096 : Buffer.byteLength(JSON.stringify(item)) + 1024; }
+
+function journalQuery(pk: string, prefix?: string) {
+  return { KeyConditionExpression: prefix ? "pk = :pk AND begins_with(sk, :prefix)" : "pk = :pk", ExpressionAttributeValues: { ":pk": pk, ...(prefix ? { ":prefix": prefix } : {}) } };
+}

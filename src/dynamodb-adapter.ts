@@ -1,5 +1,4 @@
 import {
-  BatchGetCommand,
   GetCommand,
   QueryCommand,
   TransactWriteCommand,
@@ -7,6 +6,7 @@ import {
   type TransactWriteCommandInput,
   type DynamoDBDocumentClient
 } from "@aws-sdk/lib-dynamodb";
+import { batchGetAttempts } from "./batch-get.js";
 import { randomUUID } from "node:crypto";
 import { createDocumentClient, normalizeOptions } from "./client.js";
 import { DynamoDBAdapterError, DynamoDBConflictError, isConditionalCheckFailed, isConditionalTransactionCanceled, transactionCancellationCodes } from "./errors.js";
@@ -22,7 +22,6 @@ import { participatingClient } from "./transactions/client.js";
 const MAX_TRANSACT_ITEMS = 100;
 const MAX_IN_VALUES = 1000;
 const MAX_BATCH_GET_ITEMS = 100;
-const MAX_BATCH_GET_STALLED_ATTEMPTS = 8;
 
 export class DynamoDBStore {
   private readonly client: DynamoDBDocumentClient;
@@ -643,29 +642,6 @@ function keyString(key: { pk: string; sk: string }): string {
 
 function chunk<T>(items: T[], size: number): T[][] {
   return Array.from({ length: Math.ceil(items.length / size) }, (_, index) => items.slice(index * size, (index + 1) * size));
-}
-
-async function batchGetAttempts(client: DynamoDBDocumentClient, tableName: string, keys: { pk: string; sk: string }[], consistentRead: boolean, stalledAttempts = 0, rows: StoredItem[] = []): Promise<StoredItem[]> {
-  if (keys.length === 0) return rows;
-  const result = await client.send(new BatchGetCommand({ RequestItems: { [tableName]: { Keys: keys, ConsistentRead: consistentRead } } }));
-  const nextRows = [...rows, ...((result.Responses?.[tableName] ?? []) as StoredItem[])];
-  const unprocessed = (result.UnprocessedKeys?.[tableName]?.Keys ?? []) as { pk: string; sk: string }[];
-  if (unprocessed.length === 0) return nextRows;
-  const nextStalledAttempts = batchGetStalledAttempts(keys.length, unprocessed.length, stalledAttempts);
-  await batchGetBackoff(Math.max(1, nextStalledAttempts));
-  return batchGetAttempts(client, tableName, unprocessed, consistentRead, nextStalledAttempts, nextRows);
-}
-
-function batchGetStalledAttempts(requested: number, unprocessed: number, previous: number): number {
-  // Size-limited responses and missing items can make progress without completing a batch.
-  const attempts = unprocessed < requested ? 0 : previous + 1;
-  if (attempts >= MAX_BATCH_GET_STALLED_ATTEMPTS) throw new DynamoDBAdapterError(`Better Auth DynamoDB BatchGet still had ${unprocessed} unprocessed keys after ${attempts} consecutive attempts without progress.`);
-  return attempts;
-}
-
-function batchGetBackoff(attempt: number): Promise<void> {
-  const maximum = Math.min(2 ** attempt * 10, 1000);
-  return new Promise((resolve) => setTimeout(resolve, Math.random() * maximum));
 }
 
 /** Runs independent records with bounded parallelism; failures stop new claims and all started work settles before rejection. */

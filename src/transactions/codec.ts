@@ -1,10 +1,19 @@
 import { marshall, unmarshall } from "@aws-sdk/util-dynamodb";
 import type { marshallOptions, unmarshallOptions } from "@aws-sdk/util-dynamodb";
 import type { Item } from "./types.js";
+import { itemSize } from "./item-size.js";
+import { DynamoDBAdapterError } from "../errors.js";
 
 /** AWS attribute-value JSON preserves sets, binary, and large numbers across process/runtime restarts. */
 export class JournalCodec {
   constructor(private readonly marshal?: marshallOptions, private readonly unmarshal?: unmarshallOptions) {}
+
+  validate(item: Item | null): number {
+    if (!item) return 0;
+    const size = itemSize(marshall(item, { ...this.marshal, convertTopLevelContainer: false }));
+    if (size > 400 * 1024) throw new DynamoDBAdapterError("A transaction item exceeds DynamoDB's 400 KiB item-size budget, including adapter metadata. The transaction has not committed.");
+    return size;
+  }
 
   encode(item: Item | null): Uint8Array[] {
     if (item === null) return [];

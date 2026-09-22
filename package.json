@@ -64,6 +64,8 @@
     "@babel/traverse": "^7.28.0",
     "@better-auth/core": "1.7.5",
     "@better-auth/oauth-provider": "1.7.5",
+    "@better-auth/scim": "1.7.5",
+    "@better-auth/sso": "1.7.5",
     "@better-auth/test-utils": "1.7.5",
     "@types/babel__traverse": "^7.20.7",
     "@types/node": "^20.0.0",
