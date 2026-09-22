@@ -62,4 +62,4 @@ it("resumes durable Bulk jobs across fresh auth instances with atomic outcomes a
   expect(await adapter.count({ model: "scimBulkBlob", where: [{ field: "jobId", value: job.id }] })).toBe(0);
   expect((await (await submit()).json() as JobResult)).toMatchObject({ id: job.id, status: "expired" });
   expect(await api.processSCIMBulkJob({ headers, body: { jobId: job.id, maxOperations: 17 } })).toMatchObject({ processed: 0 });
-}, 180_000);
+}, process.env.SCIM_PREVIEW_AWS_REGION ? 900_000 : 180_000);

@@ -47,4 +47,4 @@ it("does not commit a staged group grant after concurrent user deactivation", as
   expect(await adapter.count({ model: "scimGroupMember", where: [{ field: "groupId", value: group.id }] })).toBe(0);
   expect((await request(`/Groups/${group.id}`, "PATCH", add)).status).toBe(200);
   expect(await adapter.count({ model: "user", where: [{ field: "enterpriseRole", value: "member" }] })).toBe(0);
-}, 90_000);
+}, process.env.SCIM_PREVIEW_AWS_REGION ? 300_000 : 90_000);

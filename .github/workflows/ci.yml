@@ -53,7 +53,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: tgundhus/better-auth
-          ref: cf1570905c3b43ca1751f6584513e740772551fa
+          ref: f623e43ae60f66349109e1eb28fc242162178f0f
           path: .enterprise-scim-source
           persist-credentials: false
       - uses: pnpm/action-setup@v4
