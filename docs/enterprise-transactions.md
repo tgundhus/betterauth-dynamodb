@@ -133,6 +133,8 @@ Run the repository's full verification and DynamoDB Local integration suites. Lo
 
 ## Remaining release work
 
+The [staging validation guide](./staging-validation.md) reproduces these contracts on disposable DynamoDB Local or AWS tables, with request and capacity measurements.
+
 1. Confirm the expanded DynamoDB Local lifecycle contract, including connection decommissioning with every projected member and grant, on the pinned revision.
 2. Expand concurrent SCIM deactivation, group mutation, and sign-in tests to validate the plugin's revision fences under the adapter's optimistic conflicts. Query predicates do not receive SQL-style range locks.
 3. Run 10,000-member workloads and real AWS fault/load tests, measuring latency, requests, consumed capacity, bytes, contention, and cleanup cost. Configure runtime and proxy limits using those measurements.
