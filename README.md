@@ -147,7 +147,7 @@ The stable 1.2 adapter is incompatible with SCIM, SSO `resolveUser`, and SSO `gu
 | SCIM provisioning | HTTP lifecycle, group membership, transactional role projection, rollback, and deletion pass against DynamoDB Local. |
 | SSO `resolveUser` | OIDC sign-in links a SCIM identity; a rejected resolver rolls back its writes; deactivation revokes the session and blocks sign-in. |
 | SSO `guardProviderMutation` | Rejected updates/deletes roll back guard writes; accepted mutations commit. |
-| Groups above 1,000 members and `/Bulk` | Implemented in companion SCIM source changes. These features are absent from the published 1.7.5 plugin. See the enterprise validation notes. |
+| Groups above 1,000 members and `/Bulk` | With the companion SCIM changes, 1,051 Bulk-created users and a 1,051-member group pass the DynamoDB Local lifecycle test, including role projection. These features are absent from the published 1.7.5 plugin. See the enterprise validation notes. |
 | Complete production compatibility | Still requires the documented load, concurrent authentication, recovery, and migration release gates. |
 
 The preview stages callback writes, prepares durable versions in batches, and publishes them through one conditional commit decision. All participating readers and writers understand that decision. See the [SCIM transaction requirements](https://better-auth.com/docs/plugins/scim#enable-database-transactions), [SSO user resolution requirements](https://better-auth.com/docs/plugins/sso#resolve-sso-users), and [storage protocol](./docs/transaction-storage.md).
