@@ -26,10 +26,11 @@ With Docker available, run these commands from the adapter checkout in PowerShel
 $env:SCIM_PREVIEW_MODULE = 'node_modules/.scim-enterprise-preview/index.mjs'
 $env:SCIM_PREVIEW_DYNAMODB = '1'
 $env:SCIM_SCALE_MEMBERS = '1051'
+$env:SCIM_PREVIEW_CONCURRENCY = '8'
 node node_modules/vitest/vitest.mjs run --config vitest.preview.config.ts
 ```
 
-Set `SCIM_SCALE_MEMBERS` to `10000` for the larger fixture. The GitHub `ci` workflow also accepts this size through its manual `members` input. Omitting both backend variables uses the independent command double; it does not measure DynamoDB performance.
+Set `SCIM_SCALE_MEMBERS` to `10000` for the larger fixture. Set `SCIM_PREVIEW_CONCURRENCY` to a positive safe integer to exercise a measured `maxBulkConcurrency`; the manual GitHub workflow offers 8, 16, 32, and 64. The GitHub `ci` workflow also accepts the fixture size through its manual `members` input. Omitting both backend variables uses the independent command double; it does not measure DynamoDB performance.
 
 ## Disposable AWS staging tables
 
@@ -41,6 +42,7 @@ $env:SCIM_PREVIEW_AWS_REGION = 'your-staging-region'
 Remove-Item Env:SCIM_PREVIEW_DYNAMODB -ErrorAction SilentlyContinue
 $env:SCIM_PREVIEW_MODULE = 'node_modules/.scim-enterprise-preview/index.mjs'
 $env:SCIM_SCALE_MEMBERS = '1051'
+$env:SCIM_PREVIEW_CONCURRENCY = '8'
 node node_modules/vitest/vitest.mjs run --config vitest.preview.config.ts
 ```
 
@@ -52,7 +54,7 @@ Table names appear in the `preview-table` log entry. If the process is killed or
 
 Large-group lifecycle logs contain operation duration, SDK call counts and attempts, reported read/write capacity, unsplit capacity totals, and approximate returned JSON bytes. `capacityResponses: 0` means capacity was unavailable. A missing read/write split stays under `unclassifiedCapacityUnits`; it is not guessed. Returned JSON bytes are neither billed item bytes nor wire traffic. Error responses may omit consumed capacity, so failed-request cost is not fully captured. See [AWS ConsumedCapacity](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_ConsumedCapacity.html).
 
-Record the adapter and SCIM commit IDs, backend, region, workload size, SDK retry configuration, and host or Lambda memory alongside each run. Repeat representative workloads to calculate operation p50/p95/p99; a single lifecycle run cannot establish those percentiles. Keep request payloads and bearer credentials out of reports.
+Record the adapter and SCIM commit IDs, backend, region, workload size, configured concurrency, SDK retry configuration, and host or Lambda memory alongside each run. Repeat representative workloads to calculate operation p50/p95/p99; a single lifecycle run cannot establish those percentiles. Keep request payloads and bearer credentials out of reports.
 
 The storage contracts can run against AWS once staging exists. Deployed Lambda and gateway testing remains separate: verify ingress and response limits, cold starts, concurrent requests, throttling, credential rotation, worker termination, alarm delivery, and recovery after termination during preparation and cleanup. Repeat with the application's real projection callbacks and largest individual Group operation. Async workers checkpoint between resource operations; one callback still has to fit the invocation deadline. See [Lambda quotas](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html).
 

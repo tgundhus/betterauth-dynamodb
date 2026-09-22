@@ -29,7 +29,7 @@ it("provisions Bulk users and preserves every large-group member through lifecyc
     const response = await auth.handler(new Request(`http://localhost:3000/api/auth/scim/v2${path}`, { method, headers: { authorization: "Bearer test", "content-type": "application/scim+json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
     const data = response.status === 204 ? null : await response.json() as any;
     expect(response.status, JSON.stringify(data)).toBeLessThan(300);
-    console.info(JSON.stringify({ method, resource: path.split("/")[1], members: memberCount, durationMs: Math.round(performance.now() - started), dynamodb: database.metrics.since(before) }));
+    console.info(JSON.stringify({ method, resource: path.split("/")[1], members: memberCount, maxBulkConcurrency: options.maxBulkConcurrency, durationMs: Math.round(performance.now() - started), dynamodb: database.metrics.since(before) }));
     return data;
   };
   const bulk = await request("/Bulk", "POST", { schemas: ["urn:ietf:params:scim:api:messages:2.0:BulkRequest"], Operations: Array.from({ length: memberCount }, (_, index) => ({ method: "POST", path: "/Users", bulkId: `user-${index}`, data: { schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"], userName: `large-${index}@example.com` } })) });
@@ -68,5 +68,5 @@ it("provisions Bulk users and preserves every large-group member through lifecyc
   expect(await adapter.count({ model: "scimProjectionGrant", where: [{ field: "connectionId", value: "workforce" }] })).toBe(0);
   const rejected = await auth.handler(new Request("http://localhost:3000/api/auth/scim/v2/Users", { headers: { authorization: "Bearer test" } }));
   expect(rejected.status).toBe(401);
-  console.info(JSON.stringify({ operation: "decommission", members: memberCount, durationMs: Math.round(performance.now() - decommissionStarted), dynamodb: database.metrics.since(beforeDecommission) }));
+  console.info(JSON.stringify({ operation: "decommission", members: memberCount, maxBulkConcurrency: options.maxBulkConcurrency, durationMs: Math.round(performance.now() - decommissionStarted), dynamodb: database.metrics.since(beforeDecommission) }));
 }, Math.max(1_200_000, memberCount * 1_000));

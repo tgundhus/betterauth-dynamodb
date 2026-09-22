@@ -8,13 +8,15 @@ import { measuredClient } from "./metrics.js";
 /** Each native run owns a newly created table; no existing table name is accepted. */
 export async function previewDatabase() {
   const region = process.env.SCIM_PREVIEW_AWS_REGION;
+  const maxBulkConcurrency = Number(process.env.SCIM_PREVIEW_CONCURRENCY ?? 8);
+  if (!Number.isSafeInteger(maxBulkConcurrency) || maxBulkConcurrency < 1) throw new Error("SCIM_PREVIEW_CONCURRENCY must be a positive safe integer");
   if (region && process.env.SCIM_PREVIEW_DYNAMODB === "1") throw new Error("Choose AWS staging or DynamoDB Local, not both");
   if (!region && process.env.SCIM_PREVIEW_DYNAMODB !== "1") {
     const database = new MemoryDynamoDB();
     // Retaining every payload-bearing request would distort this scale test's memory use.
     database.before = () => { database.commands.length = 0; };
     const metrics = measuredClient(database.asClient());
-    return { options: { tableName: "large-scim", client: metrics.client, transactions: true }, close: async () => {}, metrics };
+    return { options: { tableName: "large-scim", client: metrics.client, transactions: true, maxBulkConcurrency }, close: async () => {}, metrics };
   }
   const container = region ? undefined : await new GenericContainer("amazon/dynamodb-local:2.6.1")
     .withExposedPorts(8000)
@@ -34,7 +36,7 @@ export async function previewDatabase() {
     created = true;
     await waitUntilTableExists({ client: native, maxWaitTime: region ? 120 : 20, minDelay: 1 }, { TableName: tableName });
     const metrics = measuredClient(DynamoDBDocumentClient.from(native, { marshallOptions: { removeUndefinedValues: true } }));
-    return { options: { tableName, client: metrics.client, transactions: true }, close, metrics };
+    return { options: { tableName, client: metrics.client, transactions: true, maxBulkConcurrency }, close, metrics };
   } catch (error) {
     await close();
     throw error;

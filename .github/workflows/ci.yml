@@ -9,6 +9,11 @@ on:
         type: choice
         options: ['1051', '10000']
         default: '10000'
+      concurrency:
+        description: Adapter bulk and projection concurrency for the load fixture
+        type: choice
+        options: ['8', '16', '32', '64']
+        default: '8'
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -78,4 +83,5 @@ jobs:
           SCIM_PREVIEW_MODULE: node_modules/.scim-enterprise-preview/index.mjs
           SCIM_PREVIEW_DYNAMODB: '1'
           SCIM_SCALE_MEMBERS: ${{ inputs.members || '1051' }}
+          SCIM_PREVIEW_CONCURRENCY: ${{ inputs.concurrency || '8' }}
         run: node node_modules/vitest/vitest.mjs run --config vitest.preview.config.ts
