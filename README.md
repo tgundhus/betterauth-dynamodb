@@ -21,6 +21,8 @@ Version `1.2.0` focuses on reducing unnecessary DynamoDB requests and handling r
 
 The 2.0 preview adds `transactions: true`, storage initialization, and a recovery API. A [scheduled Lambda worker](./examples/aws-lambda/README.md) checkpoints bounded recovery across invocations. It uses Better Auth's official `createAdapterFactory` API and requires Better Auth `^1.7.5`. Unit tests, DynamoDB Local integration tests, and Better Auth's adapter conformance suites cover the implementation. See the [changelog](./CHANGELOG.md) for release details.
 
+String sorting in the preview uses ordinal JavaScript string comparisons, consistent with its range filters. This fixes skipped records in cursor pagination over mixed-case IDs. Applications that depended on locale-aware ordering should apply their presentation collation separately.
+
 ## Installation
 
 This continuation is currently distributed from this repository. The package still uses the name `@bjorntech/betterauth-dynamodb` for compatibility, so installing that name from npm retrieves BjornTech's published package rather than this continuation.

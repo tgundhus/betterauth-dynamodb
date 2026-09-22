@@ -47,8 +47,9 @@ export class MemoryDynamoDB {
   private query(input: Row): Row {
     const partitionKey = input.ExpressionAttributeValues?.[":pk"];
     const candidates = partitionKey === undefined ? this.rows.values() : (this.partitions.get(partitionKey)?.values() ?? []);
-    let rows = [...candidates].filter((item) => condition(input.KeyConditionExpression, item, input)).sort((a, b) => String(a.sk).localeCompare(String(b.sk)));
-    if (input.ExclusiveStartKey) rows = rows.filter((item) => String(item.sk).localeCompare(String(input.ExclusiveStartKey.sk)) > 0);
+    const compareKeys = (left: unknown, right: unknown) => Buffer.compare(Buffer.from(String(left)), Buffer.from(String(right)));
+    let rows = [...candidates].filter((item) => condition(input.KeyConditionExpression, item, input)).sort((a, b) => compareKeys(a.sk, b.sk));
+    if (input.ExclusiveStartKey) rows = rows.filter((item) => compareKeys(item.sk, input.ExclusiveStartKey.sk) > 0);
     const page = rows.slice(0, input.Limit ?? rows.length);
     const last = page.at(-1);
     return { Items: page, ...(last && page.length < rows.length ? { LastEvaluatedKey: { pk: last.pk, sk: last.sk } } : {}) };

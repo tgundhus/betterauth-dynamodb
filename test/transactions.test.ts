@@ -1,4 +1,4 @@
-import { GetCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { GetCommand, NumberValue, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { describe, expect, it } from "vitest";
 import { DynamoDBStore } from "../src/dynamodb-adapter.js";
 import { initializeDynamoDBTransactions, recoverDynamoDBTransactions } from "../src/transactions/maintenance.js";
@@ -54,6 +54,14 @@ describe("DynamoDB callback transactions", () => {
   it("rejects TTL configuration that would overwrite the durable decision", async () => {
     const db = new MemoryDynamoDB();
     await expect(initializeDynamoDBTransactions({ tableName: "auth", client: db.asClient(), transactions: true, ttl: { attributeName: "state", fields: {} } })).rejects.toThrow("reserved journal metadata");
+    expect(db.rows.size).toBe(0);
+  });
+
+  it("rejects TTL attributes that would expire active journal entries", async () => {
+    const db = new MemoryDynamoDB();
+    for (const attributeName of ["before", "after", "restoreBytes", "target", "bytes"]) {
+      await expect(initializeDynamoDBTransactions({ tableName: "auth", client: db.asClient(), ttl: { attributeName, fields: {} } })).rejects.toThrow("reserved journal metadata");
+    }
     expect(db.rows.size).toBe(0);
   });
   it("commits more than 100 physical items and reads its own creates, updates, increments and deletes", async () => {
@@ -233,6 +241,30 @@ describe("durable commit and recovery", () => {
     expect([...db.rows.values()].filter((row) => row.pk === root.pk)).toHaveLength(1);
   });
 
+  it.each([false, true])("packs small recovery entries while retaining legacy journals with wrapped size hints=%s", async (wrapped) => {
+    const db = new MemoryDynamoDB();
+    const client = { config: db.config, send: async (command: any) => {
+      const result = await db.send(command);
+      if (wrapped && command instanceof QueryCommand) {
+        for (const row of result.Items ?? []) if (row.restoreBytes !== undefined) row.restoreBytes = NumberValue.from(row.restoreBytes);
+      }
+      return result;
+    } } as unknown as ReturnType<typeof db.asClient>;
+    const engine = new TransactionEngine(new Journal(client, "auth"));
+    db.before = (command) => { if (command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("deferred cleanup"); };
+    await engine.commit(changes(150));
+    const root = [...db.rows.values()].find((row) => row.state === "COMMITTED")!;
+    db.before = () => {};
+    await engine.recover(root.id, 1);
+    expect([...db.rows.values()].filter((row) => row.pk === "MODEL#test" && !row[INTENT])).toHaveLength(99);
+    // Journals written before size hints existed still use conservative bounds.
+    for (const row of db.rows.values()) if (String(row.sk).startsWith("E#")) delete row.restoreBytes;
+    await engine.recover(root.id, 1);
+    expect([...db.rows.values()].filter((row) => row.pk === "MODEL#test" && !row[INTENT])).toHaveLength(121);
+    await engine.recover(root.id);
+    expect(db.get(root)?.cleaned).toBe(true);
+  });
+
   it("batches recovery reads and tolerates another writer releasing an item during cleanup", async () => {
     const db = new MemoryDynamoDB();
     const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
@@ -260,6 +292,22 @@ describe("durable commit and recovery", () => {
     await recoverDynamoDBTransactions(options);
     expect(await store.findOne("user", eq("email", "old@example.test"))).toBeNull();
     expect(await store.findOne("user", eq("email", "new@example.test"))).toMatchObject({ id: "a" });
+  });
+
+  it("finishes recovery after writers race both the first restore batch and its retry", async () => {
+    const db = new MemoryDynamoDB();
+    const engine = new TransactionEngine(new Journal(db.asClient(), "auth"));
+    let races = 0;
+    db.before = (command) => {
+      if (!(command instanceof TransactWriteCommand) || races === 2) return;
+      const replacement = command.input.TransactItems?.find((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))?.Put?.Item;
+      if (!replacement) return;
+      db.put(versioned({ ...replacement, value: `later-${++races}` }));
+    };
+    await engine.commit(changes(110));
+    expect(races).toBe(2);
+    expect([...db.rows.values()].filter((row) => String(row.value).startsWith("later-"))).toHaveLength(2);
+    expect([...db.rows.values()].some((row) => row[INTENT])).toBe(false);
   });
 
   it("rolls back an interrupted preparation after a complete 99-item batch", async () => {

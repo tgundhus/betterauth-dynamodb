@@ -21,6 +21,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- String sorting and range filters now use the same ordinal comparisons, preventing skipped users during cursor-based reconciliation and connection decommissioning.
+- Recovery packs small journal entries into larger native batches using compatible optional size hints, retries a cleanup race as a batch, and rejects TTL field names that could expire active journal entries.
 - Recovery can be bounded across Lambda invocations, retains durable cleanup progress, and reports damaged transactions without blocking unrelated maintenance. A scheduled worker and AWS SAM deployment example are included.
 - A transient storage-format read failure no longer leaves the adapter permanently unavailable. A later request retries initialization on the same adapter instance.
 

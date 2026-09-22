@@ -137,8 +137,9 @@ export class TransactionEngine {
     let bytes = 0;
     for await (const row of this.journal.rows(dataPk(decision.id), "E#")) {
       const entry = row as Entry;
-      // Encoded payload bytes conservatively bound native item bytes.
-      const size = (entry.before + entry.after) * 128 * 1024 + 1024;
+      // New journals record a conservative encoded/native byte bound. Older journals
+      // retain the conservative full-chunk estimate during recovery.
+      const size = Number(entry.restoreBytes ?? (Number(entry.before) + Number(entry.after)) * 128 * 1024 + 1024);
       if (restoreBatchFull(entries.length, bytes + size)) {
         await this.restoreAndCheckpoint(decision, entries); entries = []; bytes = 0;
         if (--batches === 0) return 0;
@@ -157,7 +158,7 @@ export class TransactionEngine {
     await this.journal.removeEntries(decision.id, entries.map(({ index }) => index));
   }
 
-  private async restoreBatch(decision: Decision, entries: { entry: Entry; index: number }[]): Promise<void> {
+  private async restoreBatch(decision: Decision, entries: { entry: Entry; index: number }[], retry = true): Promise<void> {
     const rows = await this.journal.getMany(entries.map(({ entry }) => entry.target));
     const owned = entries.filter(({ entry, index }) => ownedBy(rows.get(keyId(entry.target)) ?? null, decision.id, index));
     if (!owned.length) return;
@@ -166,8 +167,13 @@ export class TransactionEngine {
     try { await this.journal.send([this.journal.terminalGuard(decision.id), ...actions]); }
     catch (error) {
       if (!isConditionalTransactionCanceled(error)) throw error;
-      await this.restoreIndividually(decision, owned);
+      await this.retryRestore(decision, entries, owned, retry);
     }
+  }
+
+  private async retryRestore(decision: Decision, entries: { entry: Entry; index: number }[], owned: { entry: Entry; index: number }[], retry: boolean): Promise<void> {
+    if (retry) await this.restoreBatch(decision, entries, false);
+    else await this.restoreIndividually(decision, owned);
   }
 
   private async restoreIndividually(decision: Decision, entries: { entry: Entry; index: number }[]): Promise<void> {

@@ -363,7 +363,13 @@ function compareSortValues(left: unknown, right: unknown): number {
   if (numeric !== null) return numeric;
   const dated = dateSortValue(left, right);
   if (dated !== null) return dated;
-  return String(left ?? "").localeCompare(String(right ?? ""));
+  return compareStrings(String(left ?? ""), String(right ?? ""));
+}
+
+// Cursor predicates use these same ordinal comparisons in matchesWhere.
+// Locale collation can move a row behind the cursor and silently skip it.
+function compareStrings(left: string, right: string): number {
+  return left === right ? 0 : left < right ? -1 : 1;
 }
 
 function numericSortValue(left: unknown, right: unknown): number | null {

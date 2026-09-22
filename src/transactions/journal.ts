@@ -60,7 +60,8 @@ export class Journal {
   private entryRows(id: string, index: number, change: Change): Item[] {
     const before = this.codec.encode(change.before);
     const after = this.codec.encode(change.after);
-    const entry: Entry = { ...entryKey(id, index), target: change.key, before: before.length, after: after.length };
+    const restoreBytes = Math.max(encodedBytes(before) + encodedBytes(after), this.codec.validate(change.before), this.codec.validate(change.after)) + 1024;
+    const entry: Entry = { ...entryKey(id, index), target: change.key, before: before.length, after: after.length, restoreBytes };
     return [entry, ...blobRows(id, index, "before", before), ...blobRows(id, index, "after", after)];
   }
 
@@ -135,10 +136,12 @@ function requireBlob(item: Item | null): Uint8Array {
 
 function journalRowSize(item: Item): number { return item.bytes ? (item.bytes as Uint8Array).byteLength + 4096 : Buffer.byteLength(JSON.stringify(item)) + 1024; }
 
+function encodedBytes(parts: Uint8Array[]): number { return parts.reduce((total, part) => total + part.byteLength, 0); }
+
 function journalQuery(pk: string, prefix?: string) {
   return { KeyConditionExpression: prefix ? "pk = :pk AND begins_with(sk, :prefix)" : "pk = :pk", ExpressionAttributeValues: { ":pk": pk, ...(prefix ? { ":prefix": prefix } : {}) } };
 }
 
 function validateJournalTtl(attribute: string): void {
-  if (!attribute || ["pk", "sk", "id", "state", "count", "prepared", "expires", "cleaned"].includes(attribute)) throw new DynamoDBAdapterError("Transaction TTL attribute conflicts with reserved journal metadata; configure a separate TTL attribute such as ttl.");
+  if (!attribute || ["pk", "sk", "id", "state", "count", "prepared", "expires", "cleaned", "before", "after", "restoreBytes", "target", "bytes"].includes(attribute)) throw new DynamoDBAdapterError("Transaction TTL attribute conflicts with reserved journal metadata; configure a separate TTL attribute such as ttl.");
 }

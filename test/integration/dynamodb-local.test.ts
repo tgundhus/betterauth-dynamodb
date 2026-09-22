@@ -345,6 +345,27 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(capped.findMany({ model: "plugin", where, limit: 1, offset: 1 })).rejects.toThrow(/maxPages/);
   });
 
+  it.each([false, true])("does not skip mixed-case identifiers during cursor pagination with transactions=%s", async (transactions) => {
+    const options = { tableName, client: docClient, transactions };
+    if (transactions) await initializeDynamoDBTransactions(options);
+    const store = new DynamoDBStore(options);
+    const ids = ["a", "Z", "A", "z", "é", "e", "😀", "\uE000"];
+    for (const id of ids) await store.create("member", { id, domain: "cursor-test", userId: id });
+    for (const direction of ["asc", "desc"] as const) {
+      const visited: unknown[] = [];
+      let cursor: unknown;
+      for (let page = 0; page < ids.length; page++) {
+        const where = [eq("domain", "cursor-test"), ...(cursor === undefined ? [] : [{ ...eq("userId", String(cursor)), operator: direction === "asc" ? "gt" as const : "lt" as const }])];
+        const batch = await store.findMany<{ userId: string }>("member", where, 2, 0, { field: "userId", direction });
+        if (!batch.length) break;
+        visited.push(...batch.map((row) => row.userId));
+        cursor = batch.at(-1)!.userId;
+      }
+      const expected = [...ids].sort();
+      expect(visited).toEqual(direction === "asc" ? expected : expected.reverse());
+    }
+  });
+
   it("sorts numeric fields numerically in DynamoDB-backed findMany", async () => {
     const adapter = adapterFor({ client: docClient, unsafeAllowScan: true });
     await create(adapter, "plugin", { id: "p1", externalId: "e1", kind: "score", ttl: 10 });

@@ -34,6 +34,8 @@ No transaction-item-count cap is imposed on callbacks. Individual AWS calls stay
 
 The journal batches payload reads and cleanup writes and stores large before/after payloads in 128 KiB parts. A conservative item-size check runs before preparation, including adapter metadata. It budgets numbers at DynamoDB's maximum numeric representation size, so a number-heavy item close to 400 KiB can be rejected before AWS would reject it. Keep individual authentication records comfortably below the item limit; group membership remains a relation of separate rows.
 
+New manifest entries include an optional `restoreBytes` upper bound covering both encoded payloads and native item size. Cleanup uses it to pack up to 99 small items without budgeting every tiny record as a full 128 KiB chunk. Entries from older previews still recover using the conservative chunk estimate, and older preview workers can ignore the extra field. This additive journal hint does not change logical visibility, entity keys, or the transaction format marker.
+
 Before commit, an interrupted transaction is aborted after its renewable preparation lease expires. After commit, cleanup failure leaves the committed decision and prepared versions readable. An ordinary writer can help release a conflicting terminal intent. Cleanup is idempotent and checks ownership before changing a row.
 
 An acknowledgement failure with an unresolved outcome throws `DynamoDBTransactionOutcomeUnknownError`, including `transactionId`. Do not blindly replay the mutation. Its durable root is `pk = BETTERAUTH#TXDATA#<transactionId>`, `sk = ROOT`. A `COMMITTED` decision is final. A missing decision is not evidence of rollback.
@@ -60,7 +62,7 @@ do {
 
 The limit bounds registry entries examined, not a transaction's logical size. Cleanup progress is durable in the restored records and can be retried after worker interruption. Active transaction records and payloads have no TTL. Once cleanup finishes, the decision receives seven days of retention using the configured TTL attribute, or `ttl` when no attribute is configured. Enable DynamoDB TTL on that attribute to remove completed decision records automatically; otherwise they remain stored. Never independently expire active journal records.
 
-Transaction initialization rejects TTL names that collide with journal fields: `pk`, `sk`, `id`, `state`, `count`, `prepared`, `expires`, and `cleaned`. Use a dedicated attribute such as `ttl`.
+Transaction initialization rejects TTL names that collide with journal fields: `pk`, `sk`, `id`, `state`, `count`, `prepared`, `expires`, `cleaned`, `before`, `after`, `restoreBytes`, `target`, and `bytes`. Numeric entry counts and size hints must never become expiration timestamps. Use a dedicated attribute such as `ttl`.
 
 The protocol uses existing Get, Query, BatchGet, and TransactWrite permissions. Raw DynamoDB readers, streams, and exports can contain prepared intents and journal records. They do not automatically expose the same logical view as the adapter. Restore the complete table together, including transaction metadata.
 
