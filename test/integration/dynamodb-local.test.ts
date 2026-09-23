@@ -542,23 +542,30 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(create(adapter, "oauthClientResource", { id: "fresh-compound", clientId: "client-expired", resourceId: "resource-expired" })).resolves.toMatchObject({ id: "fresh-compound" });
   });
 
-  it("runs the real Better Auth email/password and session HTTP flow", async () => {
+  it.each([false, true])("runs the real Better Auth email/password and session HTTP flow (transaction storage: %s)", async (transactionStorage) => {
+    if (transactionStorage) await initializeDynamoDBTransactions({ tableName, client: docClient, transactions: true });
     const auth = betterAuth({
       secret: "test-secret-that-is-long-enough-for-better-auth",
       baseURL: "http://localhost:3000",
-      database: dynamoDBAdapter({ tableName, client: docClient }),
+      database: dynamoDBAdapter({ tableName, client: docClient, transactionStorage }),
       emailAndPassword: { enabled: true },
       rateLimit: { enabled: false }
     });
     const signUp = await auth.handler(jsonRequest("/api/auth/sign-up/email", { email: "http@example.com", password: "password-123", name: "HTTP User" }));
     expect(signUp.status).toBe(200);
+    if (transactionStorage) {
+      const scim = new DynamoDBStore({ tableName, client: docClient, transactions: true });
+      await scim.transaction(async (trx) => {
+        await trx.update("user", [eq("email", "http@example.com")], { name: "SCIM Updated User" });
+      });
+    }
     const signIn = await auth.handler(jsonRequest("/api/auth/sign-in/email", { email: "http@example.com", password: "password-123" }));
     expect(signIn.status).toBe(200);
     const cookie = signIn.headers.get("set-cookie")?.split(";", 1)[0];
     expect(cookie).toMatch(/^better-auth\.session_token=/);
     const session = await auth.handler(new Request("http://localhost:3000/api/auth/get-session", { headers: { cookie: cookie ?? "" } }));
     expect(session.status).toBe(200);
-    await expect(session.json()).resolves.toMatchObject({ user: { email: "http@example.com" } });
+    await expect(session.json()).resolves.toMatchObject({ user: { email: "http@example.com", name: transactionStorage ? "SCIM Updated User" : "HTTP User" } });
   });
 
   it("uses the published OAuth provider schema for resource IN and refresh-family cleanup", async () => {
