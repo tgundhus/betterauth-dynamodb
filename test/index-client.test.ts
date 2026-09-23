@@ -72,6 +72,16 @@ describe("public adapter and client helpers", () => {
     expect(await adapter.findOne({ model: "user", where: [{ field: "email", value: "ada@example.com" }] })).toMatchObject({ email: "ada@example.com", name: "Ada" });
   });
 
+  it("keeps callback transactions disabled on a storage-only adapter", async () => {
+    const db = new MemoryDynamoDB();
+    const options = { tableName: "auth", client: db.asClient(), transactionStorage: true };
+    await initializeDynamoDBTransactions(options);
+    const adapter = dynamoDBAdapter(options)({ secret: "x", emailAndPassword: { enabled: true } } as never);
+    expect(adapter.options?.adapterConfig.transaction).toBe(false);
+    await adapter.create({ model: "user", data: { id: "u", email: "u@example.test", name: "User", emailVerified: true, createdAt: new Date(), updatedAt: new Date() }, forceAllowId: true });
+    expect(await adapter.findOne({ model: "user", where: [{ field: "id", value: "u" }] })).toMatchObject({ id: "u" });
+  });
+
   it.each([
     ["model remapping", { modelName: "app_user" }, "app_user", "email"],
     ["field remapping", { fields: { email: "email_address" } }, "user", "email_address"],

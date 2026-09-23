@@ -66,6 +66,31 @@ describe("DynamoDB Local adapter integration", () => {
     await deleteTable(nativeClient, tableName);
   });
 
+  it("keeps ordinary authentication reads and writes correct beside a SCIM callback", async () => {
+    let pauseCleanup = true;
+    const client = { config: docClient.config, send: async (command: any) => {
+      if (pauseCleanup && command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("cleanup paused");
+      return docClient.send(command);
+    } } as unknown as DynamoDBDocumentClient;
+    const options = { tableName, client, transactions: true };
+    await initializeDynamoDBTransactions(options);
+    const scim = new DynamoDBStore(options);
+    const auth = new DynamoDBStore({ ...options, transactions: false, transactionStorage: true });
+    await auth.create("user", { id: "u", email: "old@example.test" });
+    await scim.transaction(async (trx) => {
+      await trx.update("user", [eq("id", "u")], { email: "new@example.test" });
+      await trx.create("session", { id: "s", userId: "u" });
+      expect(await auth.findOne("user", [eq("id", "u")])).toMatchObject({ email: "old@example.test" });
+      expect(await auth.findOne("session", [eq("id", "s")])).toBeNull();
+    });
+    expect((await rawRow(modelPk("user"), entitySk("u")))?.[INTENT]).toBeDefined();
+    expect(await auth.findOne("user", [eq("id", "u")])).toMatchObject({ email: "new@example.test" });
+    expect(await auth.findOne("session", [eq("id", "s")])).toMatchObject({ userId: "u" });
+    pauseCleanup = false;
+    await auth.update("user", [eq("id", "u")], { name: "ordinary write" });
+    expect(await scim.findOne("user", [eq("id", "u")])).toMatchObject({ name: "ordinary write" });
+  });
+
   it("resumes bounded recovery through durable Lambda checkpoints on native DynamoDB", async () => {
     let interrupt = true;
     const broken = { config: docClient.config, send: async (command: any) => {

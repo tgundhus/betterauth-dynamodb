@@ -27,6 +27,32 @@ function changes(count: number): Change[] {
 function updates(command: any): Record<string, any>[] { return command instanceof TransactWriteCommand ? (command.input.TransactItems ?? []).flatMap((action) => action.Update ?? []) : []; }
 
 describe("DynamoDB callback transactions", () => {
+  it("lets ordinary auth share prepared records without exposing callback transactions", async () => {
+    const { db, options, store: scim } = await fixture();
+    const auth = new DynamoDBStore({ ...options, transactions: false, transactionStorage: true, consistentRead: false });
+    await expect(auth.transaction(async () => "unexpected")).rejects.toThrow("not enabled");
+    await auth.create("user", { id: "u", email: "old@example.test" });
+    await scim.transaction(async (trx) => {
+      await trx.update("user", id("u"), { email: "new@example.test" });
+      await trx.create("session", { id: "s", userId: "u" });
+      expect(await auth.findOne("user", id("u"))).toMatchObject({ email: "old@example.test" });
+      expect(await auth.findOne("session", id("s"))).toBeNull();
+    });
+    expect(await auth.findOne("user", eq("email", "new@example.test"))).toMatchObject({ id: "u" });
+    expect(await auth.findOne("session", id("s"))).toMatchObject({ userId: "u" });
+    await auth.update("user", id("u"), { name: "ordinary write" });
+    expect(await scim.findOne("user", id("u"))).toMatchObject({ name: "ordinary write" });
+    expect(db.commands.filter((command) => command instanceof GetCommand && command.input.Key?.pk === FORMAT_KEY.pk).length).toBeGreaterThan(0);
+    expect(db.commands.filter((command) => command instanceof GetCommand && command.input.Key?.pk === "MODEL#s4:user").every((command) => command.input.ConsistentRead === true)).toBe(true);
+  });
+
+  it("requires initialization for storage-only participants", async () => {
+    const db = new MemoryDynamoDB();
+    const auth = new DynamoDBStore({ tableName: "auth", client: db.asClient(), transactionStorage: true });
+    await expect(auth.findOne("user", id("u"))).rejects.toThrow("initialized transaction storage format");
+    await expect(auth.create("user", { id: "u" })).rejects.toThrow("initialized transaction storage format");
+  });
+
   it("recovers the same adapter instance after a transient format-marker read failure", async () => {
     const { store, db } = await fixture();
     let failures = 1;

@@ -6,6 +6,8 @@ This is an opt-in 2.0 preview under active validation. Published SCIM and SSO wo
 
 Stop all authentication readers, writers, maintenance jobs, and direct table consumers that do not understand this protocol. Deploy compatible code to every participating process. Do not mix 1.2 processes with transaction-mode processes.
 
+The same table can serve ordinary authentication and SCIM. After initialization, configure ordinary Better Auth instances with `transactionStorage: true` and SCIM or transaction-dependent SSO instances with `transactions: true`. Ordinary instances still resolve prepared versions and guard writes, but report no callback transaction capability to Better Auth. Do not run either a 1.2 adapter or a 2.0 adapter with both options omitted against this table.
+
 ```ts
 import {
   dynamoDBAdapter,
@@ -20,9 +22,11 @@ await initializeDynamoDBTransactions(databaseOptions);
 const database = dynamoDBAdapter(databaseOptions);
 ```
 
+An ordinary auth instance that does not register SCIM or transaction-dependent SSO hooks can use the same table and client with `transactionStorage: true` instead of `transactions: true`. This split limits callback transactions to the paths that need them; it does not permit mixed storage-protocol versions.
+
 Initialization writes a format marker. Existing entity/index keys and entity revision UUIDs are preserved; existing records do not require an eager rewrite. Participating writes add a physical revision attribute to every changed row, including sidecars and unique locks. The protocol reserves `__betterAuthDynamoDBTransaction` and `__betterAuthDynamoDBPhysicalRevision`; these are not application fields.
 
-Transaction mode forces strong reads. It also removes the default 25-page and 1,000-value IN limits, while retaining chunked requests and bounded concurrency. An explicitly configured `maxPages` remains an application-selected budget. Query shapes without an indexed anchor still follow the documented `unsafeAllowScan` policy; plugin query coverage remains a release gate.
+Both participating modes force strong reads. Callback transaction mode also removes the default 25-page and 1,000-value IN limits, while retaining chunked requests and bounded concurrency. Storage-only participants keep those ordinary query limits. An explicitly configured `maxPages` remains an application-selected budget. Query shapes without an indexed anchor still follow the documented `unsafeAllowScan` policy; plugin query coverage remains a release gate.
 
 ## Commit and recovery
 

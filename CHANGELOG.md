@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Opt-in callback transactions backed by a durable DynamoDB journal, conditional item preparation, one commit decision, and resumable cleanup. Callbacks read their staged changes and can exceed one native 100-action transaction.
 - Explicit transaction storage initialization and registry-based recovery APIs, with an error carrying the transaction ID when commit outcome cannot be resolved.
+- `transactionStorage: true` for ordinary auth instances sharing initialized transaction storage without advertising callback transactions.
 - Published SCIM and SSO HTTP integration contracts covering provisioning, role projection rollback, identity linking, deactivation, session revocation, and guarded provider mutations.
 - A separate large-group and Bulk contract test for the companion SCIM source changes.
 
