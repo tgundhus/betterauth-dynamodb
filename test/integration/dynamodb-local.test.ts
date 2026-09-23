@@ -66,6 +66,31 @@ describe("DynamoDB Local adapter integration", () => {
     await deleteTable(nativeClient, tableName);
   });
 
+  it("keeps ordinary authentication reads and writes correct beside a SCIM callback", async () => {
+    let pauseCleanup = true;
+    const client = { config: docClient.config, send: async (command: any) => {
+      if (pauseCleanup && command instanceof TransactWriteCommand && command.input.TransactItems?.some((action) => action.Put?.ConditionExpression?.includes("#intent.#id"))) throw new Error("cleanup paused");
+      return docClient.send(command);
+    } } as unknown as DynamoDBDocumentClient;
+    const options = { tableName, client, transactions: true };
+    await initializeDynamoDBTransactions(options);
+    const scim = new DynamoDBStore(options);
+    const auth = new DynamoDBStore({ ...options, transactions: false, transactionStorage: true });
+    await auth.create("user", { id: "u", email: "old@example.test" });
+    await scim.transaction(async (trx) => {
+      await trx.update("user", [eq("id", "u")], { email: "new@example.test" });
+      await trx.create("session", { id: "s", userId: "u" });
+      expect(await auth.findOne("user", [eq("id", "u")])).toMatchObject({ email: "old@example.test" });
+      expect(await auth.findOne("session", [eq("id", "s")])).toBeNull();
+    });
+    expect((await rawRow(modelPk("user"), entitySk("u")))?.[INTENT]).toBeDefined();
+    expect(await auth.findOne("user", [eq("id", "u")])).toMatchObject({ email: "new@example.test" });
+    expect(await auth.findOne("session", [eq("id", "s")])).toMatchObject({ userId: "u" });
+    pauseCleanup = false;
+    await auth.update("user", [eq("id", "u")], { name: "ordinary write" });
+    expect(await scim.findOne("user", [eq("id", "u")])).toMatchObject({ name: "ordinary write" });
+  });
+
   it("resumes bounded recovery through durable Lambda checkpoints on native DynamoDB", async () => {
     let interrupt = true;
     const broken = { config: docClient.config, send: async (command: any) => {
@@ -517,23 +542,30 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(create(adapter, "oauthClientResource", { id: "fresh-compound", clientId: "client-expired", resourceId: "resource-expired" })).resolves.toMatchObject({ id: "fresh-compound" });
   });
 
-  it("runs the real Better Auth email/password and session HTTP flow", async () => {
+  it.each([false, true])("runs the real Better Auth email/password and session HTTP flow (transaction storage: %s)", async (transactionStorage) => {
+    if (transactionStorage) await initializeDynamoDBTransactions({ tableName, client: docClient, transactions: true });
     const auth = betterAuth({
       secret: "test-secret-that-is-long-enough-for-better-auth",
       baseURL: "http://localhost:3000",
-      database: dynamoDBAdapter({ tableName, client: docClient }),
+      database: dynamoDBAdapter({ tableName, client: docClient, transactionStorage }),
       emailAndPassword: { enabled: true },
       rateLimit: { enabled: false }
     });
     const signUp = await auth.handler(jsonRequest("/api/auth/sign-up/email", { email: "http@example.com", password: "password-123", name: "HTTP User" }));
     expect(signUp.status).toBe(200);
+    if (transactionStorage) {
+      const scim = new DynamoDBStore({ tableName, client: docClient, transactions: true });
+      await scim.transaction(async (trx) => {
+        await trx.update("user", [eq("email", "http@example.com")], { name: "SCIM Updated User" });
+      });
+    }
     const signIn = await auth.handler(jsonRequest("/api/auth/sign-in/email", { email: "http@example.com", password: "password-123" }));
     expect(signIn.status).toBe(200);
     const cookie = signIn.headers.get("set-cookie")?.split(";", 1)[0];
     expect(cookie).toMatch(/^better-auth\.session_token=/);
     const session = await auth.handler(new Request("http://localhost:3000/api/auth/get-session", { headers: { cookie: cookie ?? "" } }));
     expect(session.status).toBe(200);
-    await expect(session.json()).resolves.toMatchObject({ user: { email: "http@example.com" } });
+    await expect(session.json()).resolves.toMatchObject({ user: { email: "http@example.com", name: transactionStorage ? "SCIM Updated User" : "HTTP User" } });
   });
 
   it("uses the published OAuth provider schema for resource IN and refresh-family cleanup", async () => {

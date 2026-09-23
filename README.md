@@ -103,6 +103,7 @@ See the standalone [deployment examples](./examples/) for AWS Lambda, Alchemy, a
 | `maxBulkConcurrency`                         | Bounds independent bulk mutations, `IN` queries, batch reads, and supported transaction projection work. Defaults to `8`.                             |
 | `uniqueFields`                               | Adds explicit single-field uniqueness rules using DynamoDB lock rows.                                                                                 |
 | `enforceSchemaUniqueIndexes`                 | Enforces Better Auth compound unique indexes. Existing data requires a duplicate audit and lock backfill first.                                       |
+| `transactionStorage`                         | Participates in initialized transaction storage without offering callback transactions. Use on ordinary auth instances sharing a table with SCIM.     |
 | `transactions`                               | Enables the `2.0` callback transaction protocol. Storage initialization, compatible readers and writers, and recovery are mandatory.                  |
 
 The package exports `BetterAuthDynamoDBOptions`, `TtlOptions`, `DynamoDBAdapterError`, `DynamoDBConflictError`, and `UnsupportedQueryError`.
@@ -134,9 +135,11 @@ Read the [changelog](./CHANGELOG.md) for detailed behavior and compatibility not
 
 Better Auth's current SCIM plugin and some advanced SSO hooks require interactive callback transactions. Stable `1.2` does not provide them. The `2.0` preview implements them entirely on DynamoDB through durable preparation, one commit decision, rollback, and recovery.
 
+On a shared table, ordinary auth instances can use `transactionStorage: true` while SCIM and transaction-dependent SSO instances use `transactions: true`. Both modes resolve prepared records and protect ordinary writes. Only `transactions: true` advertises callback transactions to Better Auth. Every reader and writer must use one of these modes after initialization; a 1.2 adapter or a 2.0 adapter with both options omitted is unsafe on the migrated table.
+
 The protocol has no fixed 100-item logical transaction limit. It divides physical DynamoDB work into bounded requests while preserving one atomic result. A SCIM Group operation is therefore not exposed as partially committed membership chunks.
 
-Large groups, `/Bulk`, and asynchronous provisioning also require the companion [Better Auth SCIM changes](https://github.com/tgundhus/better-auth/tree/feat/large-groups-and-bulk).
+Large groups, `/Bulk`, and asynchronous provisioning also require the companion [Better Auth SCIM changes](https://github.com/tgundhus/better-auth/tree/main/packages/scim).
 
 Before enabling transactions, read:
 
@@ -153,7 +156,7 @@ Upgrading to stable `1.2` requires no storage migration. Add `dynamodb:BatchGetI
 
 Enabling compound schema uniqueness on existing data requires a maintenance window, duplicate repair, and lock backfill. The adapter does not supply an automatic migration utility.
 
-The `2.0` transaction preview is a separate coordinated upgrade. Do not enable `transactions: true` on an existing table until every reader and writer is compatible and the recovery worker is deployed.
+The `2.0` transaction preview is a separate coordinated upgrade. Do not enable `transactionStorage: true` or `transactions: true` on an existing table until every reader and writer is compatible, storage is initialized, and the recovery worker is deployed.
 
 ## Verification
 

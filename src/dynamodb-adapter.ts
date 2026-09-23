@@ -43,7 +43,7 @@ export class DynamoDBStore {
 
   async transaction<R>(callback: (store: DynamoDBStore) => Promise<R>): Promise<R> {
     if (this.context) return callback(this);
-    if (!this.engine) throw new DynamoDBAdapterError("Callback transactions are not enabled.");
+    if (!this.options.transactions || !this.engine) throw new DynamoDBAdapterError("Callback transactions are not enabled.");
     const context = new CallbackContext(this.engine, (item) => this.allSidecars(item.model, item.entity));
     const scoped = new DynamoDBStore({ ...this.options, client: this.client, transactionContext: context, transactionEngine: this.engine });
     try {
@@ -322,16 +322,17 @@ export class DynamoDBStore {
     return this.loadOwners([...unique.values()], clause);
   }
 
-  private assertInValues(count: number): void { if (!this.engine) assertInValueCount(count); }
+  private assertInValues(count: number): void { if (!this.options.transactions) assertInValueCount(count); }
 }
 
 function transactionOptions(options: DynamoDBStoreOptions): DynamoDBStoreOptions {
-  return options.transactions ? { ...options, consistentRead: true, maxPages: options.maxPages ?? Number.MAX_SAFE_INTEGER } : options;
+  if (options.transactions) return { ...options, consistentRead: true, maxPages: options.maxPages ?? Number.MAX_SAFE_INTEGER };
+  return options.transactionStorage ? { ...options, consistentRead: true } : options;
 }
 
 function storeEngine(options: DynamoDBStoreOptions, raw: DynamoDBDocumentClient): TransactionEngine | undefined {
   if (options.transactionEngine) return options.transactionEngine;
-  return options.transactions ? new TransactionEngine(new Journal(raw, options.tableName, ttlAttribute(options.ttl))) : undefined;
+  return options.transactions || options.transactionStorage ? new TransactionEngine(new Journal(raw, options.tableName, ttlAttribute(options.ttl))) : undefined;
 }
 
 function transactionReadOrder(rows: StoredItem[], plan: QueryPlan): StoredItem[] {

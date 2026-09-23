@@ -20,7 +20,9 @@ export interface BetterAuthDynamoDBOptions {
   enforceSchemaUniqueIndexes?: boolean;
   /** Maximum concurrent bulk transactions, scalar IN queries, or BatchGet chunks. */
   maxBulkConcurrency?: number;
-  /** Opt in to the initialized, adapter-managed callback transaction storage protocol. */
+  /** Participate in initialized transaction storage without offering callback transactions. Required for ordinary readers and writers sharing a table with transactional SCIM. */
+  transactionStorage?: boolean;
+  /** Offer callback transactions and participate in initialized transaction storage. */
   transactions?: boolean;
 }
 
